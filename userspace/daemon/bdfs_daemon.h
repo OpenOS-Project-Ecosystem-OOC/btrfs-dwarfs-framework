@@ -48,6 +48,7 @@ enum bdfs_job_type {
 	BDFS_JOB_SNAPSHOT_CONTAINER,   /* btrfs subvolume snapshot */
 	BDFS_JOB_MOUNT_BLEND,          /* mount -t bdfs_blend */
 	BDFS_JOB_UMOUNT_BLEND,         /* umount blend point */
+	BDFS_JOB_PROMOTE_COPYUP,       /* copy DwarFS file to BTRFS upper layer */
 };
 
 /* A unit of work dispatched to the thread pool */
@@ -110,6 +111,18 @@ struct bdfs_job {
 			char    blend_mount[BDFS_PATH_MAX];
 			struct bdfs_mount_opts opts;
 		} mount_blend;
+
+		/*
+		 * Copy-up: promote a single file from a DwarFS lower layer
+		 * to the BTRFS upper layer so it can be written.
+		 * Triggered by BDFS_EVT_SNAPSHOT_CREATED with "copyup_needed".
+		 */
+		struct {
+			uint8_t  btrfs_uuid[16];    /* blend mount's BTRFS UUID */
+			uint64_t inode_no;          /* blend inode number */
+			char     lower_path[BDFS_PATH_MAX]; /* source on DwarFS */
+			char     upper_path[BDFS_PATH_MAX]; /* dest on BTRFS */
+		} promote_copyup;
 	};
 
 	/* Completion callback (called from worker thread) */
@@ -162,6 +175,7 @@ int bdfs_job_umount_dwarfs(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_store_image(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_snapshot_container(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_mount_blend(struct bdfs_daemon *d, struct bdfs_job *job);
+int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job);
 
 /* netlink event listener (bdfs_netlink.c) */
 int  bdfs_netlink_init(struct bdfs_daemon *d);

@@ -205,4 +205,17 @@ struct bdfs_ioctl_demote_to_dwarfs {
 #define BDFS_IOC_DEMOTE_TO_DWARFS \
 	_IOWR(BDFS_IOCTL_MAGIC, 0x32, struct bdfs_ioctl_demote_to_dwarfs)
 
+/*
+ * Signal copy-up completion to the kernel.  Called by the daemon after it
+ * has promoted a DwarFS-backed file to the BTRFS upper layer.  The kernel
+ * wakes any threads blocked in bdfs_blend_open() waiting for this inode.
+ */
+struct bdfs_ioctl_copyup_complete {
+	__u8    btrfs_uuid[16];         /* blend mount's BTRFS partition UUID */
+	__u64   inode_no;               /* blend inode number being promoted */
+	char    upper_path[BDFS_PATH_MAX]; /* new path on BTRFS upper layer */
+};
+#define BDFS_IOC_COPYUP_COMPLETE \
+	_IOW(BDFS_IOCTL_MAGIC, 0x40, struct bdfs_ioctl_copyup_complete)
+
 #endif /* _UAPI_BDFS_IOCTL_H */

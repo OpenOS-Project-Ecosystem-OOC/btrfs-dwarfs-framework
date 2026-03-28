@@ -97,6 +97,14 @@ int bdfs_blend_mount(void __user *uarg,
 
 int bdfs_blend_umount(void __user *uarg);
 
+/*
+ * Called from BDFS_IOC_COPYUP_COMPLETE ioctl handler in bdfs_main.c.
+ * Updates the blend inode to point at the new BTRFS upper-layer path
+ * and wakes threads blocked in bdfs_blend_open().
+ */
+void bdfs_blend_complete_copyup(struct inode *inode,
+				const struct path *upper_path);
+
 /* ── Partition list helpers (bdfs_main.c) ────────────────────────────── */
 
 int bdfs_list_partitions(void __user *uarg,

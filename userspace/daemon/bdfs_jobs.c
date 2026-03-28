@@ -362,6 +362,133 @@ int bdfs_job_snapshot_container(struct bdfs_daemon *d, struct bdfs_job *job)
 		readonly);
 }
 
+/* ── Copy-up: promote DwarFS file to BTRFS upper layer ──────────────────── */
+
+/*
+ * bdfs_job_promote_copyup - Copy a file from a DwarFS lower layer to the
+ * BTRFS upper layer, then signal the kernel that the copy-up is complete.
+ *
+ * Flow:
+ *   1. Ensure the parent directory exists on the upper layer.
+ *   2. Copy the file using copy_file_range (reflink if same FS, else copy).
+ *   3. Preserve permissions and timestamps via stat + utimensat/chmod/chown.
+ *   4. Call BDFS_IOC_COPYUP_COMPLETE so the kernel wakes blocked openers.
+ */
+int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job)
+{
+	const struct bdfs_job *j = job;
+	const char *src = j->promote_copyup.lower_path;
+	const char *dst = j->promote_copyup.upper_path;
+	struct stat st;
+	int src_fd = -1, dst_fd = -1;
+	off_t offset = 0;
+	ssize_t copied;
+	int ret = 0;
+	char parent[BDFS_PATH_MAX];
+	char *slash;
+
+	/* Step 1: ensure parent directory exists on upper layer */
+	snprintf(parent, sizeof(parent), "%s", dst);
+	slash = strrchr(parent, '/');
+	if (slash && slash != parent) {
+		*slash = '\0';
+		/* mkdir -p equivalent: ignore EEXIST */
+		if (mkdir(parent, 0755) < 0 && errno != EEXIST) {
+			syslog(LOG_ERR, "bdfs: copyup: mkdir %s: %m", parent);
+			return -errno;
+		}
+	}
+
+	/* Step 2: open source (DwarFS FUSE mount) */
+	src_fd = open(src, O_RDONLY | O_CLOEXEC);
+	if (src_fd < 0) {
+		syslog(LOG_ERR, "bdfs: copyup: open src %s: %m", src);
+		return -errno;
+	}
+
+	if (fstat(src_fd, &st) < 0) {
+		ret = -errno;
+		goto out;
+	}
+
+	/* Step 3: create destination on BTRFS upper layer */
+	dst_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+		      st.st_mode & 0777);
+	if (dst_fd < 0 && errno == EEXIST) {
+		/* Already copied by a concurrent thread — success */
+		ret = 0;
+		goto out;
+	}
+	if (dst_fd < 0) {
+		syslog(LOG_ERR, "bdfs: copyup: create dst %s: %m", dst);
+		ret = -errno;
+		goto out;
+	}
+
+	/* Step 4: copy data */
+	while (offset < st.st_size) {
+		copied = copy_file_range(src_fd, &offset,
+					 dst_fd, NULL,
+					 (size_t)(st.st_size - offset), 0);
+		if (copied < 0) {
+			if (errno == EXDEV || errno == EOPNOTSUPP) {
+				/* Fallback: read/write loop */
+				char buf[65536];
+				ssize_t n;
+				while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
+					if (write(dst_fd, buf, (size_t)n) != n) {
+						ret = -errno;
+						goto out;
+					}
+				}
+				if (n < 0)
+					ret = -errno;
+				break;
+			}
+			ret = -errno;
+			goto out;
+		}
+	}
+
+	/* Step 5: preserve ownership and timestamps */
+	if (fchown(dst_fd, st.st_uid, st.st_gid) < 0)
+		syslog(LOG_WARNING, "bdfs: copyup: chown %s: %m", dst);
+
+	{
+		struct timespec times[2] = { st.st_atim, st.st_mtim };
+		if (futimens(dst_fd, times) < 0)
+			syslog(LOG_WARNING, "bdfs: copyup: utimens %s: %m", dst);
+	}
+
+	syslog(LOG_INFO, "bdfs: copyup complete: %s → %s", src, dst);
+
+out:
+	if (src_fd >= 0) close(src_fd);
+	if (dst_fd >= 0) {
+		close(dst_fd);
+		if (ret)
+			unlink(dst);
+	}
+
+	if (ret == 0) {
+		/* Step 6: signal the kernel that copy-up is done */
+		struct bdfs_ioctl_copyup_complete arg;
+		memset(&arg, 0, sizeof(arg));
+		memcpy(arg.btrfs_uuid, j->promote_copyup.btrfs_uuid, 16);
+		arg.inode_no = j->promote_copyup.inode_no;
+		snprintf(arg.upper_path, sizeof(arg.upper_path), "%s", dst);
+
+		if (ioctl(d->ctl_fd, BDFS_IOC_COPYUP_COMPLETE, &arg) < 0) {
+			syslog(LOG_ERR,
+			       "bdfs: copyup: BDFS_IOC_COPYUP_COMPLETE failed: %m");
+			/* Non-fatal: the file is copied; the kernel will
+			 * time out and the opener will get -ETIMEDOUT. */
+		}
+	}
+
+	return ret;
+}
+
 /* ── Mount blend layer ──────────────────────────────────────────────────── */
 
 /*

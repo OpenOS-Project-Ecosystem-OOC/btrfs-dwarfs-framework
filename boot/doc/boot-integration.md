@@ -130,6 +130,17 @@ sudo bdfs-image-update --image /path/to/new_system.dwarfs --dry-run
 
 # Force update even if hash matches
 sudo bdfs-image-update --image /path/to/new_system.dwarfs --force
+
+# Provide an explicit SHA-256 hash (overrides sidecar file)
+sudo bdfs-image-update --image /path/to/new_system.dwarfs \
+    --sha256 abc123...
+
+# Provide a local GPG signature file
+sudo bdfs-image-update --image /path/to/new_system.dwarfs \
+    --sig /path/to/new_system.dwarfs.sig
+
+# Skip GPG verification
+sudo bdfs-image-update --image /path/to/new_system.dwarfs --no-gpg
 ```
 
 Automatic updates run via the systemd timer (daily by default):
@@ -139,11 +150,65 @@ systemctl enable --now bdfs-image-update.timer
 systemctl status bdfs-image-update.timer
 ```
 
-Configure the update URL in `/etc/bdfs/boot.conf`:
+Configure the update URL and verification in `/etc/bdfs/boot.conf`:
 
 ```ini
 update_url = https://example.com/images/system.dwarfs
-update_checksum = <sha256>
+# Optional: inline SHA-256 (takes precedence over .sha256 sidecar)
+update_checksum = <sha256hex>
+# Path to GPG keyring with trusted release signing key(s)
+gpg_keyring = /etc/bdfs/trusted.gpg
+# Set to 1 to require a valid GPG signature on every update
+require_gpg = 0
+```
+
+### Verification pipeline
+
+For each update, `bdfs-image-update` runs these checks in order before
+rotating the image into place:
+
+1. **SHA-256** — computed over the downloaded image and compared against
+   (in priority order): `--sha256` CLI argument, `update_checksum` in
+   `boot.conf`, or a `.sha256` sidecar file fetched from
+   `${update_url}.sha256`.
+
+2. **GPG detached signature** — the `.sha256` sidecar file is verified
+   against a `.sig` file fetched from `${update_url}.sig` (or provided
+   via `--sig`).  The signature is checked against the keyring at
+   `gpg_keyring`.  A present-but-invalid signature is always fatal.
+   A missing signature produces a warning unless `require_gpg = 1`.
+
+3. **dwarfsck** — structural integrity of the DwarFS image itself.
+
+### Setting up the GPG keyring
+
+```bash
+# Import the release signing key into the BDFS keyring
+gpg --no-default-keyring \
+    --keyring /etc/bdfs/trusted.gpg \
+    --import /path/to/release-key.asc
+
+# Verify the keyring contains the expected key
+gpg --no-default-keyring \
+    --keyring /etc/bdfs/trusted.gpg \
+    --list-keys
+```
+
+### Signing images (server side)
+
+```bash
+# Generate a SHA-256 sidecar
+sha256sum system.dwarfs > system.dwarfs.sha256
+
+# Sign the sidecar with the release key
+gpg --detach-sign --armor \
+    --local-user release@example.com \
+    system.dwarfs.sha256
+mv system.dwarfs.sha256.asc system.dwarfs.sig
+
+# Publish all three files
+rsync system.dwarfs system.dwarfs.sha256 system.dwarfs.sig \
+    user@example.com:/var/www/images/
 ```
 
 ## Rollback

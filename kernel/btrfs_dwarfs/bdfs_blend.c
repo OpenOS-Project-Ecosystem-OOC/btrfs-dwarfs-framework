@@ -39,6 +39,10 @@
 #include <linux/seq_file.h>
 #include <linux/statfs.h>
 #include <linux/xattr.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/file.h>
+#include <linux/writeback.h>
 
 #include "bdfs_internal.h"
 
@@ -136,6 +140,7 @@ struct bdfs_blend_inode_info {
 	struct inode    vfs_inode;
 	struct path     real_path;      /* path on the backing layer */
 	bool            is_upper;       /* true = BTRFS, false = DwarFS lower */
+	atomic_t        copyup_done;    /* set to 1 when daemon finishes copy-up */
 };
 
 static inline struct bdfs_blend_inode_info *
@@ -153,6 +158,7 @@ static struct inode *bdfs_blend_alloc_inode(struct super_block *sb)
 		return NULL;
 	memset(&bi->real_path, 0, sizeof(bi->real_path));
 	bi->is_upper = false;
+	atomic_set(&bi->copyup_done, 0);
 	return &bi->vfs_inode;
 }
 
@@ -194,6 +200,7 @@ static struct inode *bdfs_blend_make_inode(struct super_block *sb,
 	path_get(real_path);
 	bi->real_path = *real_path;
 	bi->is_upper  = is_upper;
+	atomic_set(&bi->copyup_done, is_upper ? 1 : 0);
 
 	/* Mirror attributes from the real inode */
 	inode->i_ino   = real->i_ino;
@@ -334,56 +341,439 @@ static int bdfs_blend_getattr(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/* ── Copy-up synchronization ─────────────────────────────────────────────── */
+
+/*
+ * Per-inode copy-up state.  When a write is attempted on a DwarFS-backed
+ * inode the kernel emits a BDFS_EVT_COPYUP_NEEDED event and then waits on
+ * copyup_done.  The daemon performs the promote job and calls back via
+ * BDFS_IOC_COPYUP_COMPLETE (handled in bdfs_main.c), which wakes all
+ * waiters and flips copyup_done to 1.
+ *
+ * Once copy-up completes, real_path is updated to point at the new BTRFS
+ * upper-layer file and is_upper is set to true.  Subsequent opens skip
+ * the copy-up path entirely.
+ */
+static DECLARE_WAIT_QUEUE_HEAD(bdfs_copyup_wq);
+
+/*
+ * bdfs_blend_trigger_copyup - Emit copy-up event and wait for completion.
+ *
+ * Returns 0 when the daemon has finished promoting the file to the BTRFS
+ * upper layer, or a negative error code on timeout / signal.
+ *
+ * The caller must hold no locks.  We use an interruptible wait with a
+ * 30-second timeout so a crashed daemon does not wedge the process forever.
+ */
+static int bdfs_blend_trigger_copyup(struct inode *inode,
+				     struct bdfs_blend_mount *bm)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	long timeout;
+
+	/*
+	 * Emit the event.  The daemon listens on the netlink socket and will
+	 * start a BDFS_JOB_PROMOTE for this inode.  We encode the inode
+	 * number in object_id so the daemon can correlate the completion.
+	 */
+	bdfs_emit_event(BDFS_EVT_SNAPSHOT_CREATED,
+			bm->btrfs_uuid, inode->i_ino,
+			"copyup_needed");
+
+	/*
+	 * Wait for the daemon to signal completion.  The daemon calls
+	 * BDFS_IOC_COPYUP_COMPLETE which sets bi->copyup_done and wakes us.
+	 */
+	timeout = wait_event_interruptible_timeout(
+		bdfs_copyup_wq,
+		atomic_read(&bi->copyup_done) != 0,
+		30 * HZ);
+
+	if (timeout < 0)
+		return -EINTR;
+	if (timeout == 0)
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
+/* ── Write path helpers ──────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_upper_path - Return the real path on the BTRFS upper layer.
+ *
+ * For upper-layer inodes this is bi->real_path directly.  For lower-layer
+ * inodes this constructs the corresponding upper-layer path by appending
+ * the dentry name to the BTRFS upper root.  Used by write operations that
+ * need to operate on the upper layer even before copy-up has run.
+ */
+static int bdfs_blend_upper_path(struct inode *dir, struct dentry *dentry,
+				 struct bdfs_blend_mount *bm,
+				 struct path *upper_path)
+{
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+
+	if (!bm->btrfs_mnt)
+		return -EIO;
+
+	/*
+	 * If the parent is already on the upper layer, resolve relative to it.
+	 * Otherwise resolve relative to the BTRFS upper root.
+	 */
+	if (parent_bi->is_upper) {
+		return vfs_path_lookup(parent_bi->real_path.dentry,
+				       parent_bi->real_path.mnt,
+				       dentry->d_name.name, 0, upper_path);
+	}
+
+	return vfs_path_lookup(bm->btrfs_mnt->mnt_root,
+			       bm->btrfs_mnt,
+			       dentry->d_name.name, 0, upper_path);
+}
+
+/* ── File operations ─────────────────────────────────────────────────────── */
+
 /*
  * bdfs_blend_open - Forward open to the real backing file.
  *
- * For writes to a DwarFS-backed inode, copy-up is triggered first:
- * the file is copied to the BTRFS upper layer and the inode's real_path
- * is updated to point to the upper layer copy.
+ * For write-mode opens on a DwarFS-backed inode, copy-up is triggered:
+ * we emit a promote event to the daemon and block until it completes.
+ * Once copy-up is done, real_path points to the BTRFS upper layer and
+ * subsequent opens take the fast path.
  */
 static int bdfs_blend_open(struct inode *inode, struct file *file)
 {
 	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
 	struct super_block *sb = inode->i_sb;
 	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	int ret;
 
-	/*
-	 * Copy-up: if this is a write to a lower-layer (DwarFS) inode,
-	 * we need to materialise it on the BTRFS upper layer first.
-	 * The actual copy-up is performed by the daemon via a
-	 * BDFS_JOB_PROMOTE job; here we emit the event and block until
-	 * the upper layer copy is ready.
-	 *
-	 * For the kernel module we emit the event and return -EAGAIN;
-	 * the VFS will retry after the daemon completes the copy-up.
-	 */
 	if (!bi->is_upper && (file->f_flags & (O_WRONLY | O_RDWR))) {
-		if (bm) {
-			bdfs_emit_event(BDFS_EVT_SNAPSHOT_CREATED,
-					bm->btrfs_uuid, inode->i_ino,
-					"copyup_needed");
-		}
-		return -EAGAIN;
+		ret = bdfs_blend_trigger_copyup(inode, bm);
+		if (ret)
+			return ret;
+		/*
+		 * After copy-up, bi->real_path and bi->is_upper have been
+		 * updated by bdfs_blend_complete_copyup() called from the
+		 * BDFS_IOC_COPYUP_COMPLETE ioctl handler.
+		 */
 	}
 
-	/* Forward to the real file on the backing layer */
-	return finish_open(file, bi->real_path.dentry,
-			   generic_file_open);
+	return finish_open(file, bi->real_path.dentry, generic_file_open);
 }
 
+/*
+ * bdfs_blend_write_iter - Forward writes to the BTRFS upper layer.
+ *
+ * Reads are served from whichever layer holds the file (upper or lower).
+ * Writes always go to the upper layer; copy-up has already been performed
+ * by bdfs_blend_open() before we reach here.
+ */
+static ssize_t bdfs_blend_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct file *real_file;
+	ssize_t ret;
+
+	if (!bi->is_upper)
+		return -EROFS;
+
+	/*
+	 * Open the real upper-layer file and proxy the write through it.
+	 * We use a temporary file reference so the real filesystem's
+	 * write_iter (BTRFS) handles locking, journalling, and CoW.
+	 */
+	real_file = dentry_open(&bi->real_path, file->f_flags, current_cred());
+	if (IS_ERR(real_file))
+		return PTR_ERR(real_file);
+
+	iocb->ki_filp = real_file;
+	ret = real_file->f_op->write_iter(iocb, iter);
+	iocb->ki_filp = file;
+
+	/* Sync size back to the blend inode */
+	inode->i_size = file_inode(real_file)->i_size;
+
+	fput(real_file);
+	return ret;
+}
+
+/* ── Directory write operations ──────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_create - Create a new regular file on the BTRFS upper layer.
+ *
+ * New files are always created on the upper layer regardless of whether a
+ * lower-layer directory exists at the same path.
+ */
+static int bdfs_blend_create(struct mnt_idmap *idmap,
+			     struct inode *dir, struct dentry *dentry,
+			     umode_t mode, bool excl)
+{
+	struct super_block *sb = dir->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct path upper_parent;
+	struct dentry *upper_dentry;
+	struct inode *new_inode;
+	int ret;
+
+	if (!bm || !bm->btrfs_mnt)
+		return -EIO;
+
+	/* Resolve the parent directory on the upper layer */
+	if (parent_bi->is_upper) {
+		path_get(&parent_bi->real_path);
+		upper_parent = parent_bi->real_path;
+	} else {
+		ret = vfs_path_lookup(bm->btrfs_mnt->mnt_root,
+				      bm->btrfs_mnt, "", 0, &upper_parent);
+		if (ret)
+			return ret;
+	}
+
+	upper_dentry = lookup_one_len(dentry->d_name.name,
+				      upper_parent.dentry,
+				      dentry->d_name.len);
+	if (IS_ERR(upper_dentry)) {
+		path_put(&upper_parent);
+		return PTR_ERR(upper_dentry);
+	}
+
+	ret = vfs_create(idmap, d_inode(upper_parent.dentry),
+			 upper_dentry, mode, excl);
+	if (ret) {
+		dput(upper_dentry);
+		path_put(&upper_parent);
+		return ret;
+	}
+
+	/* Wrap the new upper-layer inode in a blend inode */
+	struct path new_path = { .mnt = upper_parent.mnt,
+				 .dentry = upper_dentry };
+	new_inode = bdfs_blend_make_inode(sb, &new_path, true);
+	dput(upper_dentry);
+	path_put(&upper_parent);
+
+	if (!new_inode)
+		return -ENOMEM;
+
+	d_instantiate(dentry, new_inode);
+	return 0;
+}
+
+/*
+ * bdfs_blend_mkdir - Create a directory on the BTRFS upper layer.
+ */
+static int bdfs_blend_mkdir(struct mnt_idmap *idmap,
+			    struct inode *dir, struct dentry *dentry,
+			    umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct path upper_parent;
+	struct dentry *upper_dentry;
+	struct inode *new_inode;
+	int ret;
+
+	if (!bm || !bm->btrfs_mnt)
+		return -EIO;
+
+	if (parent_bi->is_upper) {
+		path_get(&parent_bi->real_path);
+		upper_parent = parent_bi->real_path;
+	} else {
+		ret = vfs_path_lookup(bm->btrfs_mnt->mnt_root,
+				      bm->btrfs_mnt, "", 0, &upper_parent);
+		if (ret)
+			return ret;
+	}
+
+	upper_dentry = lookup_one_len(dentry->d_name.name,
+				      upper_parent.dentry,
+				      dentry->d_name.len);
+	if (IS_ERR(upper_dentry)) {
+		path_put(&upper_parent);
+		return PTR_ERR(upper_dentry);
+	}
+
+	ret = vfs_mkdir(idmap, d_inode(upper_parent.dentry),
+			upper_dentry, mode);
+	if (ret) {
+		dput(upper_dentry);
+		path_put(&upper_parent);
+		return ret;
+	}
+
+	struct path new_path = { .mnt = upper_parent.mnt,
+				 .dentry = upper_dentry };
+	new_inode = bdfs_blend_make_inode(sb, &new_path, true);
+	dput(upper_dentry);
+	path_put(&upper_parent);
+
+	if (!new_inode)
+		return -ENOMEM;
+
+	d_instantiate(dentry, new_inode);
+	return 0;
+}
+
+/*
+ * bdfs_blend_unlink - Remove a file from the BTRFS upper layer.
+ *
+ * Removing a file that exists only in a DwarFS lower layer is not permitted
+ * without a prior promote (copy-up).  The blend layer is not a full
+ * union filesystem — whiteouts are not implemented.
+ */
+static int bdfs_blend_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(d_inode(dentry));
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct mnt_idmap *idmap;
+
+	if (!bi->is_upper)
+		return -EPERM;	/* must promote before deleting */
+
+	idmap = mnt_idmap(bi->real_path.mnt);
+	return vfs_unlink(idmap,
+			  d_inode(parent_bi->real_path.dentry),
+			  bi->real_path.dentry,
+			  NULL);
+}
+
+/*
+ * bdfs_blend_rmdir - Remove a directory from the BTRFS upper layer.
+ */
+static int bdfs_blend_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(d_inode(dentry));
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct mnt_idmap *idmap;
+
+	if (!bi->is_upper)
+		return -EPERM;
+
+	idmap = mnt_idmap(bi->real_path.mnt);
+	return vfs_rmdir(idmap,
+			 d_inode(parent_bi->real_path.dentry),
+			 bi->real_path.dentry);
+}
+
+/*
+ * bdfs_blend_rename - Rename within the BTRFS upper layer.
+ *
+ * Both source and destination must be on the upper layer.  Renaming a
+ * lower-layer entry requires a prior promote.
+ */
+static int bdfs_blend_rename(struct mnt_idmap *idmap,
+			     struct inode *old_dir, struct dentry *old_dentry,
+			     struct inode *new_dir, struct dentry *new_dentry,
+			     unsigned int flags)
+{
+	struct bdfs_blend_inode_info *src_bi = BDFS_I(d_inode(old_dentry));
+	struct bdfs_blend_inode_info *old_parent_bi = BDFS_I(old_dir);
+	struct bdfs_blend_inode_info *new_parent_bi = BDFS_I(new_dir);
+
+	if (!src_bi->is_upper)
+		return -EPERM;
+
+	if (!old_parent_bi->is_upper || !new_parent_bi->is_upper)
+		return -EPERM;
+
+	return vfs_rename(idmap,
+			  &(struct renamedata){
+				.old_mnt_idmap = idmap,
+				.old_dir       = d_inode(old_parent_bi->real_path.dentry),
+				.old_dentry    = src_bi->real_path.dentry,
+				.new_mnt_idmap = idmap,
+				.new_dir       = d_inode(new_parent_bi->real_path.dentry),
+				.new_dentry    = new_dentry,
+				.flags         = flags,
+			  });
+}
+
+/*
+ * bdfs_blend_setattr - Forward attribute changes to the BTRFS upper layer.
+ *
+ * chmod/chown/truncate on a lower-layer inode requires copy-up first.
+ */
+static int bdfs_blend_setattr(struct mnt_idmap *idmap,
+			      struct dentry *dentry, struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	int ret;
+
+	if (!bi->is_upper) {
+		ret = bdfs_blend_trigger_copyup(inode, bm);
+		if (ret)
+			return ret;
+	}
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+
+	ret = notify_change(idmap, bi->real_path.dentry, attr, NULL);
+	if (ret)
+		return ret;
+
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
+/*
+ * bdfs_blend_complete_copyup - Called from BDFS_IOC_COPYUP_COMPLETE ioctl.
+ *
+ * Updates the inode's real_path to point at the new BTRFS upper-layer file,
+ * marks it as upper, and wakes all threads waiting in bdfs_blend_open().
+ *
+ * @inode:      the blend inode being promoted
+ * @upper_path: the new path on the BTRFS upper layer
+ */
+void bdfs_blend_complete_copyup(struct inode *inode,
+				const struct path *upper_path)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+
+	path_put(&bi->real_path);
+	path_get(upper_path);
+	bi->real_path = *upper_path;
+	bi->is_upper  = true;
+
+	atomic_set(&bi->copyup_done, 1);
+	wake_up_all(&bdfs_copyup_wq);
+}
+EXPORT_SYMBOL_GPL(bdfs_blend_complete_copyup);
+
 static const struct inode_operations bdfs_blend_file_iops = {
-	.getattr = bdfs_blend_getattr,
+	.getattr  = bdfs_blend_getattr,
+	.setattr  = bdfs_blend_setattr,
 };
 
 static const struct file_operations bdfs_blend_file_fops = {
-	.open    = bdfs_blend_open,
+	.open       = bdfs_blend_open,
 	.read_iter  = generic_file_read_iter,
+	.write_iter = bdfs_blend_write_iter,
 	.llseek     = generic_file_llseek,
+	.fsync      = generic_file_fsync,
 };
 
 static const struct inode_operations bdfs_blend_dir_iops = {
 	.lookup  = bdfs_blend_lookup,
 	.getattr = bdfs_blend_getattr,
+	.setattr = bdfs_blend_setattr,
+	.create  = bdfs_blend_create,
+	.mkdir   = bdfs_blend_mkdir,
+	.unlink  = bdfs_blend_unlink,
+	.rmdir   = bdfs_blend_rmdir,
+	.rename  = bdfs_blend_rename,
 };
 
 /* ── Filesystem type registration ───────────────────────────────────────── */
@@ -397,7 +787,6 @@ static int bdfs_blend_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_magic = BDFS_BLEND_MAGIC;
 	sb->s_op = &bdfs_blend_sops;
 	sb->s_fs_info = bm;
-	sb->s_flags |= SB_RDONLY; /* blend root is read-only; writes go to upper */
 
 	root_inode = new_inode(sb);
 	if (!root_inode)

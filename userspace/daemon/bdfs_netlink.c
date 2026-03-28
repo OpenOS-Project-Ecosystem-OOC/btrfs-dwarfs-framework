@@ -177,26 +177,61 @@ static void bdfs_handle_event(struct bdfs_daemon *d,
 
 	case BDFS_EVT_SNAPSHOT_CREATED: {
 		/*
-		 * Message format:
-		 *   "snapshot image_id=<id> snap=<name> readonly=<0|1>"
+		 * Two sub-types share this event code:
+		 *
+		 * 1. Copy-up request from bdfs_blend_open():
+		 *    message = "copyup_needed"
+		 *    object_id = blend inode number
+		 *    partition_uuid = BTRFS upper layer UUID
+		 *
+		 * 2. Normal snapshot request:
+		 *    message = "snapshot image_id=<id> snap=<name> readonly=<0|1>"
 		 */
-		uint64_t image_id = 0;
-		char snap_name[BDFS_NAME_MAX + 1] = {0};
-		int readonly = 0;
+		if (strncmp(evt->message, "copyup_needed", 13) == 0) {
+			/*
+			 * The kernel is blocked in bdfs_blend_open() waiting
+			 * for this file to be promoted to the BTRFS upper layer.
+			 * Enqueue a BDFS_JOB_PROMOTE_COPYUP job.
+			 *
+			 * The lower_path and upper_path are not available from
+			 * the netlink event alone; the daemon resolves them from
+			 * the inode number via /proc/self/fd or a path cache.
+			 * For now we encode the inode number and let the job
+			 * handler resolve the paths from the blend mount table.
+			 */
+			job = bdfs_job_alloc(BDFS_JOB_PROMOTE_COPYUP);
+			if (!job) break;
 
-		sscanf(evt->message,
-		       "snapshot image_id=%llu snap=%255s readonly=%d",
-		       &image_id, snap_name, &readonly);
+			memcpy(job->promote_copyup.btrfs_uuid,
+			       evt->partition_uuid, 16);
+			job->promote_copyup.inode_no = evt->object_id;
+			/* lower_path / upper_path filled by job handler
+			 * using the blend mount table keyed on btrfs_uuid */
+		} else {
+			/*
+			 * Normal snapshot request.
+			 * Message format:
+			 *   "snapshot image_id=<id> snap=<name> readonly=<0|1>"
+			 */
+			uint64_t image_id = 0;
+			char snap_name[BDFS_NAME_MAX + 1] = {0};
+			int readonly = 0;
 
-		job = bdfs_job_alloc(BDFS_JOB_SNAPSHOT_CONTAINER);
-		if (!job) break;
+			sscanf(evt->message,
+			       "snapshot image_id=%llu snap=%255s readonly=%d",
+			       &image_id, snap_name, &readonly);
 
-		memcpy(job->partition_uuid, evt->partition_uuid, 16);
-		job->object_id = image_id;
-		job->snapshot_container.flags =
-			readonly ? BDFS_SNAP_READONLY : 0;
-		strncpy(job->snapshot_container.snapshot_path, snap_name,
-			sizeof(job->snapshot_container.snapshot_path) - 1);
+			job = bdfs_job_alloc(BDFS_JOB_SNAPSHOT_CONTAINER);
+			if (!job) break;
+
+			memcpy(job->partition_uuid, evt->partition_uuid, 16);
+			job->object_id = image_id;
+			job->snapshot_container.flags =
+				readonly ? BDFS_SNAP_READONLY : 0;
+			strncpy(job->snapshot_container.snapshot_path,
+				snap_name,
+				sizeof(job->snapshot_container.snapshot_path) - 1);
+		}
 		break;
 	}
 

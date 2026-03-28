@@ -83,6 +83,9 @@ static void *worker_thread(void *arg)
 		case BDFS_JOB_MOUNT_BLEND:
 			result = bdfs_job_mount_blend(d, job);
 			break;
+		case BDFS_JOB_PROMOTE_COPYUP:
+			result = bdfs_job_promote_copyup(d, job);
+			break;
 		default:
 			syslog(LOG_WARNING, "bdfs: unknown job type %d", job->type);
 			result = -EINVAL;

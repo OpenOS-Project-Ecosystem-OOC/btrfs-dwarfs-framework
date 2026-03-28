@@ -206,6 +206,30 @@ jobs:
             exit 0
           fi
 
+      - name: Install kernel headers and build tools
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            linux-headers-$(uname -r) build-essential kmod cmake ninja-build
+
+      - name: Build userspace CLI (needed by kernel module test)
+        run: |
+          cmake -S userspace -B build/userspace \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_DAEMON=ON \
+            -DBUILD_CLI=ON
+          cmake --build build/userspace --parallel
+
+      - name: Build kernel module
+        run: |
+          make kernel KDIR=/lib/modules/$(uname -r)/build || true
+          if [[ -f kernel/btrfs_dwarfs/btrfs_dwarfs.ko ]]; then
+            echo "KO_BUILT=true" >> "$GITHUB_ENV"
+          else
+            echo "KO_BUILT=false" >> "$GITHUB_ENV"
+            echo "⚠️  Kernel module not built — kernel ioctl tests will be skipped"
+          fi
+
       - name: Load required kernel modules
         run: |
           sudo modprobe btrfs   || true

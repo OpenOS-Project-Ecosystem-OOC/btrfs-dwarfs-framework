@@ -56,10 +56,25 @@ if(BUILD_DAEMON)
         RUNTIME DESTINATION sbin
     )
 
-    # systemd service unit
+    # Generate the systemd service unit with the correct sbin path substituted.
+    # configure_file replaces @CMAKE_INSTALL_FULL_SBINDIR@ at cmake-configure
+    # time so the installed unit always points at the real binary location.
+    set(BDFS_DAEMON_BIN "${CMAKE_INSTALL_PREFIX}/sbin/bdfs_daemon")
+    configure_file(
+        ${CMAKE_SOURCE_DIR}/../configs/bdfs_daemon.service.in
+        ${CMAKE_CURRENT_BINARY_DIR}/bdfs_daemon.service
+        @ONLY
+    )
     install(FILES
-        ${CMAKE_SOURCE_DIR}/../configs/bdfs_daemon.service
+        ${CMAKE_CURRENT_BINARY_DIR}/bdfs_daemon.service
         DESTINATION lib/systemd/system
+        OPTIONAL
+    )
+
+    # Default daemon config
+    install(FILES
+        ${CMAKE_SOURCE_DIR}/../configs/bdfs.conf
+        DESTINATION etc/bdfs
         OPTIONAL
     )
 endif()
@@ -94,6 +109,21 @@ if(BUILD_CLI)
     install(FILES
         ${CMAKE_SOURCE_DIR}/../doc/bdfs_daemon.8
         DESTINATION share/man/man8
+        OPTIONAL
+    )
+
+    # Boot image update script
+    install(PROGRAMS
+        ${CMAKE_SOURCE_DIR}/../boot/bdfs-image-update
+        DESTINATION sbin
+        OPTIONAL
+    )
+
+    # Boot systemd units
+    install(FILES
+        ${CMAKE_SOURCE_DIR}/../boot/systemd-generator/bdfs-image-update.service
+        ${CMAKE_SOURCE_DIR}/../boot/systemd-generator/bdfs-image-update.timer
+        DESTINATION lib/systemd/system
         OPTIONAL
     )
 endif()

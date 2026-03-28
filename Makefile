@@ -57,7 +57,19 @@ install-userspace: userspace
 
 # ── Combined ─────────────────────────────────────────────────────────────────
 
-install: install-kernel install-userspace
+install: install-kernel install-userspace install-post
+
+# Post-install: refresh module dependencies, man page index, and systemd units.
+# Each step is best-effort (|| true) so install succeeds on minimal systems
+# that lack mandb or a running systemd.
+install-post:
+	depmod -a 2>/dev/null || true
+	mandb -q 2>/dev/null || true
+	@if command -v systemctl >/dev/null 2>&1 && \
+	    systemctl is-system-running >/dev/null 2>&1; then \
+	    systemctl daemon-reload; \
+	    echo "systemd units reloaded"; \
+	fi
 
 clean: clean-kernel clean-userspace
 

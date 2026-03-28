@@ -55,6 +55,7 @@ fi
 
 # Run all test suites
 for suite in \
+    "$SCRIPT_DIR/test_kernel_module.sh" \
     "$SCRIPT_DIR/test_dwarfs_partition.sh" \
     "$SCRIPT_DIR/test_btrfs_partition.sh" \
     "$SCRIPT_DIR/test_blend_layer.sh" \

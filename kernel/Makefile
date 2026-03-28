@@ -30,6 +30,8 @@ clean:
 install: all
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules_install
 	depmod -a
+	@echo "Kernel module installed: btrfs_dwarfs.ko"
+	@echo "Load with: modprobe btrfs_dwarfs"
 
 # Load / unload helpers
 .PHONY: load unload

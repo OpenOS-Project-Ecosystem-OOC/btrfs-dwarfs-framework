@@ -21,6 +21,7 @@
 #include <linux/uuid.h>
 #include <linux/miscdevice.h>
 #include <linux/netlink.h>
+#include <linux/namei.h>
 #include <net/sock.h>
 
 #include "../../include/uapi/bdfs_ioctl.h"
@@ -30,6 +31,9 @@ MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("BTRFS+DwarFS Framework Contributors");
 MODULE_DESCRIPTION("BTRFS and DwarFS hybrid filesystem framework");
 MODULE_VERSION("1.0.0");
+
+/* Forward declaration */
+static int bdfs_copyup_complete(void __user *uarg);
 
 /* Global partition registry */
 static DEFINE_MUTEX(bdfs_registry_lock);
@@ -187,6 +191,51 @@ void bdfs_emit_event(enum bdfs_event_type type, const u8 uuid[16],
 }
 EXPORT_SYMBOL_GPL(bdfs_emit_event);
 
+/* ── Copy-up completion ─────────────────────────────────────────────────── */
+
+/*
+ * bdfs_copyup_complete - Handle BDFS_IOC_COPYUP_COMPLETE from the daemon.
+ *
+ * The daemon calls this after it has promoted a DwarFS-backed file to the
+ * BTRFS upper layer.  We look up the blend inode by number, update its
+ * real_path to the new upper-layer path, and wake any threads blocked in
+ * bdfs_blend_open() waiting for this copy-up.
+ */
+static int bdfs_copyup_complete(void __user *uarg)
+{
+	struct bdfs_ioctl_copyup_complete arg;
+	struct path upper_path;
+	struct inode *inode;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	/* Resolve the upper-layer path provided by the daemon */
+	ret = kern_path(arg.upper_path, LOOKUP_FOLLOW, &upper_path);
+	if (ret)
+		return ret;
+
+	/*
+	 * Find the blend inode.  We iterate the superblock's inode list
+	 * looking for the inode number the daemon reported.  In a production
+	 * implementation this would use a dedicated hash table keyed on
+	 * (btrfs_uuid, inode_no); for now a linear scan is sufficient since
+	 * concurrent copy-ups are rare.
+	 */
+	inode = ilookup(upper_path.dentry->d_sb, (unsigned long)arg.inode_no);
+	if (!inode) {
+		path_put(&upper_path);
+		return -ENOENT;
+	}
+
+	bdfs_blend_complete_copyup(inode, &upper_path);
+
+	iput(inode);
+	path_put(&upper_path);
+	return 0;
+}
+
 /* ── Control device file operations ────────────────────────────────────── */
 
 static long bdfs_ctl_ioctl(struct file *file, unsigned int cmd,
@@ -247,6 +296,9 @@ static long bdfs_ctl_ioctl(struct file *file, unsigned int cmd,
 	case BDFS_IOC_LIST_BTRFS_SUBVOLS:
 		return bdfs_btrfs_list_subvols(uarg, &bdfs_partition_list,
 					       &bdfs_registry_lock);
+
+	case BDFS_IOC_COPYUP_COMPLETE:
+		return bdfs_copyup_complete(uarg);
 
 	default:
 		return -ENOTTY;
