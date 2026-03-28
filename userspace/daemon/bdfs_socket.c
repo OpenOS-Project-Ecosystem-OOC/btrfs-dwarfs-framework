@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <syslog.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -124,7 +125,7 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 			 "\"workers\":%d,"
 			 "\"queue_depth\":%d,"
 			 "\"active_mounts\":%d,"
-			 "\"policy_demotes\":%llu,"
+			 "\"policy_demotes\":%" PRIu64 ","
 			 "\"policy_last_scan\":%lld"
 			 "}}\n",
 			 d->worker_count, queue_depth,
@@ -140,6 +141,7 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 		 * Parse key fields from the JSON request.
 		 * Format: {"cmd":"policy-add","args":{...}}
 		 */
+		/* cppcheck-suppress uninitvar -- all fields set via memset+explicit assigns below */
 		struct bdfs_policy_rule rule;
 		memset(&rule, 0, sizeof(rule));
 		rule.compression = BDFS_COMPRESS_ZSTD;
@@ -184,7 +186,7 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 		if (d->policy && rule.age_days > 0) {
 			uint64_t id = bdfs_policy_add_rule(d->policy, &rule);
 			snprintf(resp, sizeof(resp),
-				 "{\"status\":0,\"data\":{\"rule_id\":%llu}}\n",
+				 "{\"status\":0,\"data\":{\"rule_id\":%" PRIu64 "}}\n",
 				 (unsigned long long)id);
 		} else {
 			snprintf(resp, sizeof(resp),
@@ -219,7 +221,7 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 			pos += written; rem -= written;
 			for (uint32_t i = 0; i < count && rem > 2; i++) {
 				written = snprintf(pos, rem,
-					"%s{\"id\":%llu,\"age_days\":%u,"
+					"%s{\"id\":%" PRIu64 ",\"age_days\":%u,"
 					"\"pattern\":\"%s\","
 					"\"compression\":\"%s\","
 					"\"delete_after\":%s,"

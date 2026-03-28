@@ -215,6 +215,7 @@ int  bdfs_socket_init(struct bdfs_daemon *d);
 void bdfs_socket_loop(struct bdfs_daemon *d);
 
 /* tool execution helpers (bdfs_exec.c) */
+int bdfs_exec_wait(const char *const argv[]);
 int bdfs_exec_mkdwarfs(struct bdfs_daemon *d,
 		       const char *input_dir,
 		       const char *output_image,

@@ -157,15 +157,15 @@ int bdfs_daemon_init(struct bdfs_daemon *d, struct bdfs_daemon_config *cfg)
 
 	/* Create state directory */
 	if (mkdir(d->cfg.state_dir, 0700) < 0 && errno != EEXIST) {
-		syslog(LOG_ERR, "bdfs: cannot create state dir %s: %m",
-		       d->cfg.state_dir);
+		syslog(LOG_ERR, "bdfs: cannot create state dir %s: %s",
+		       d->cfg.state_dir, strerror(errno));
 		return -errno;
 	}
 
 	/* Open control device */
 	d->ctl_fd = open(d->cfg.ctl_device, O_RDWR | O_CLOEXEC);
 	if (d->ctl_fd < 0) {
-		syslog(LOG_ERR, "bdfs: cannot open %s: %m", d->cfg.ctl_device);
+		syslog(LOG_ERR, "bdfs: cannot open %s: %s", d->cfg.ctl_device, strerror(errno));
 		return -errno;
 	}
 
@@ -242,7 +242,7 @@ int bdfs_daemon_run(struct bdfs_daemon *d)
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			syslog(LOG_ERR, "bdfs: select error: %m");
+			syslog(LOG_ERR, "bdfs: select error: %s", strerror(errno));
 			break;
 		}
 

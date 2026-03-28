@@ -27,6 +27,7 @@
 	     (var) && ((tvar) = TAILQ_NEXT((var), field), 1); \
 	     (var) = (tvar))
 #endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,7 +47,18 @@
  * is in <linux/btrfs_tree.h>.  We include both defensively; on kernels
  * where btrfs_tree.h is absent we fall back to the du-based estimate.
  */
-#ifdef __has_include
+/*
+ * cppcheck does not implement __has_include and evaluates it as 0/0,
+ * producing a preprocessorErrorDirective. Use a cppcheck-specific path
+ * that avoids __has_include entirely while keeping the real compiler path.
+ */
+#ifdef __cppcheck__
+/* cppcheck analysis path: include unconditionally, suppress __has_include */
+#  ifdef __linux__
+#    include <linux/btrfs.h>
+#    define HAVE_BTRFS_IOCTL 1
+#  endif
+#elif defined(__has_include)
 #  if __has_include(<linux/btrfs.h>)
 #    include <linux/btrfs.h>
 #    define HAVE_BTRFS_IOCTL 1
@@ -57,6 +69,20 @@
 #else
 #  include <linux/btrfs.h>
 #  define HAVE_BTRFS_IOCTL 1
+#endif
+
+/*
+ * le64_to_cpu may be provided by <linux/btrfs_tree.h> but is not guaranteed
+ * in userspace builds. Provide a portable fallback via <endian.h>.
+ */
+#ifndef le64_to_cpu
+#  include <endian.h>
+#  if __BYTE_ORDER == __LITTLE_ENDIAN
+#    define le64_to_cpu(x) ((uint64_t)(x))
+#  else
+#    include <byteswap.h>
+#    define le64_to_cpu(x) bswap_64((uint64_t)(x))
+#  endif
 #endif
 
 #include "bdfs_policy.h"
@@ -269,6 +295,7 @@ int bdfs_policy_scan(struct bdfs_policy_engine *pe)
 
 	pthread_mutex_lock(&pe->rules_lock);
 
+	/* cppcheck-suppress uninitvar -- rule is initialised by TAILQ_FOREACH */
 	TAILQ_FOREACH(rule, &pe->rules, entry) {
 		struct bdfs_ioctl_list_btrfs_subvols list_arg;
 		struct bdfs_btrfs_subvol *subvols = NULL;
@@ -451,6 +478,7 @@ int bdfs_policy_remove_rule(struct bdfs_policy_engine *pe, uint64_t rule_id)
 	int ret = -ENOENT;
 
 	pthread_mutex_lock(&pe->rules_lock);
+	/* cppcheck-suppress uninitvar -- rule is initialised by TAILQ_FOREACH */
 	TAILQ_FOREACH(rule, &pe->rules, entry) {
 		if (rule->rule_id == rule_id) {
 			TAILQ_REMOVE(&pe->rules, rule, entry);

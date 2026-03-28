@@ -37,7 +37,7 @@ static const char *compression_name(uint32_t c)
  * bdfs_exec_wait - Fork, exec argv[], and wait for exit.
  * Returns 0 on success, -errno on fork failure, or the child exit code.
  */
-static int bdfs_exec_wait(const char *const argv[])
+int bdfs_exec_wait(const char *const argv[])
 {
 	pid_t pid;
 	int status;
