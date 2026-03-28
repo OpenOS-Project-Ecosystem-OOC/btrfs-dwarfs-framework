@@ -21,6 +21,7 @@
 #include <syslog.h>
 
 #include "bdfs_daemon.h"
+#include "bdfs_policy.h"
 
 #define BDFS_DEFAULT_CTL_DEVICE  "/dev/bdfs_ctl"
 #define BDFS_DEFAULT_SOCKET_PATH "/run/bdfs/daemon.sock"
@@ -188,6 +189,19 @@ int bdfs_daemon_init(struct bdfs_daemon *d, struct bdfs_daemon_config *cfg)
 		return ret;
 	}
 
+	/* Start the auto-demote policy engine */
+	d->policy = calloc(1, sizeof(*d->policy));
+	if (d->policy) {
+		ret = bdfs_policy_init(d->policy, d);
+		if (ret) {
+			syslog(LOG_WARNING,
+			       "bdfs: policy engine init failed: %d (continuing)",
+			       ret);
+			free(d->policy);
+			d->policy = NULL;
+		}
+	}
+
 	syslog(LOG_INFO, "bdfs: daemon initialised (%d workers)", d->worker_count);
 	return 0;
 }
@@ -248,6 +262,12 @@ void bdfs_daemon_shutdown(struct bdfs_daemon *d)
 	if (d->sock_fd >= 0) {
 		close(d->sock_fd);
 		unlink(d->cfg.socket_path);
+	}
+
+	if (d->policy) {
+		bdfs_policy_shutdown(d->policy);
+		free(d->policy);
+		d->policy = NULL;
 	}
 
 	pthread_mutex_destroy(&d->queue_lock);

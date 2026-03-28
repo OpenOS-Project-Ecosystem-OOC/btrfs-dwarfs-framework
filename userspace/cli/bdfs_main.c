@@ -295,6 +295,13 @@ static void print_usage(void)
 "\n"
 "Other:\n"
 "  status                 Show daemon and framework status\n"
+"  verify                 Verify DwarFS image integrity via dwarfsck\n"
+"\n"
+"Policy (auto-demote):\n"
+"  policy add             Add an auto-demote rule\n"
+"  policy remove          Remove an auto-demote rule\n"
+"  policy list            List active rules\n"
+"  policy scan            Trigger an immediate policy scan\n"
 "\n"
 "Run 'bdfs COMMAND --help' for command-specific help.\n"
 	);
@@ -363,6 +370,18 @@ int main(int argc, char *argv[])
 		else if (!strcmp(sub, "list"))   ret = cmd_partition_list(&cli, sub_argc, sub_argv);
 		else if (!strcmp(sub, "show"))   ret = cmd_partition_show(&cli, sub_argc, sub_argv);
 		else { bdfs_err("unknown partition subcommand: %s", sub); ret = 1; }
+	} else if (!strcmp(cmd, "policy")) {
+		if (sub_argc < 2) {
+			bdfs_err("policy requires a subcommand: add|remove|list|scan");
+			return 1;
+		}
+		const char *sub = sub_argv[1];
+		sub_argc--; sub_argv++;
+		if (!strcmp(sub, "add"))         ret = cmd_policy_add(&cli, sub_argc, sub_argv);
+		else if (!strcmp(sub, "remove")) ret = cmd_policy_remove(&cli, sub_argc, sub_argv);
+		else if (!strcmp(sub, "list"))   ret = cmd_policy_list(&cli, sub_argc, sub_argv);
+		else if (!strcmp(sub, "scan"))   ret = cmd_policy_scan(&cli, sub_argc, sub_argv);
+		else { bdfs_err("unknown policy subcommand: %s", sub); ret = 1; }
 	} else if (!strcmp(cmd, "blend")) {
 		if (sub_argc < 2) {
 			bdfs_err("blend requires a subcommand: mount|umount");
@@ -383,6 +402,7 @@ int main(int argc, char *argv[])
 	else if (!strcmp(cmd, "promote"))  ret = cmd_promote(&cli, sub_argc, sub_argv);
 	else if (!strcmp(cmd, "demote"))   ret = cmd_demote(&cli, sub_argc, sub_argv);
 	else if (!strcmp(cmd, "status"))   ret = cmd_status(&cli, sub_argc, sub_argv);
+	else if (!strcmp(cmd, "verify"))   ret = cmd_verify(&cli, sub_argc, sub_argv);
 	else {
 		bdfs_err("unknown command: %s", cmd);
 		print_usage();

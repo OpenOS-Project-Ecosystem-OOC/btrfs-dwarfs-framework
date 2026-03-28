@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 
 #include "bdfs_daemon.h"
+#include "bdfs_policy.h"
 
 #define BDFS_SOCK_BACKLOG   8
 #define BDFS_SOCK_BUFSIZE   65536
@@ -104,15 +105,152 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 	if (strstr(req, "\"list-partitions\"")) {
 		snprintf(resp, sizeof(resp),
 			 "{\"status\":0,\"data\":{\"note\":\"use ioctl\"}}\n");
+
 	} else if (strstr(req, "\"status\"")) {
+		/* Count queued jobs */
+		int queue_depth = 0;
+		pthread_mutex_lock(&d->queue_lock);
+		struct bdfs_job *j;
+		TAILQ_FOREACH(j, &d->job_queue, entry) queue_depth++;
+		pthread_mutex_unlock(&d->queue_lock);
+
+		uint64_t total_demotes = 0;
+		time_t last_scan = 0;
+		if (d->policy) {
+			total_demotes = d->policy->total_demotes;
+			last_scan     = d->policy->last_scan_time;
+		}
 		snprintf(resp, sizeof(resp),
 			 "{\"status\":0,\"data\":{"
 			 "\"workers\":%d,"
-			 "\"queue_depth\":0"
+			 "\"queue_depth\":%d,"
+			 "\"policy_demotes\":%llu,"
+			 "\"policy_last_scan\":%lld"
 			 "}}\n",
-			 d->worker_count);
+			 d->worker_count, queue_depth,
+			 (unsigned long long)total_demotes,
+			 (long long)last_scan);
+
 	} else if (strstr(req, "\"ping\"")) {
 		snprintf(resp, sizeof(resp), "{\"status\":0,\"data\":\"pong\"}\n");
+
+	} else if (strstr(req, "\"policy-add\"")) {
+		/*
+		 * Parse key fields from the JSON request.
+		 * Format: {"cmd":"policy-add","args":{...}}
+		 */
+		struct bdfs_policy_rule rule;
+		memset(&rule, 0, sizeof(rule));
+		rule.compression = BDFS_COMPRESS_ZSTD;
+
+		/* Extract partition UUID */
+		char *p = strstr(req, "\"partition\":\"");
+		if (p) {
+			p += strlen("\"partition\":\"");
+			char uuid_str[37] = {0};
+			strncpy(uuid_str, p, 36);
+			/* bdfs_str_to_uuid not available here; store raw */
+			/* In production use a real JSON parser */
+		}
+
+		/* Extract age_days */
+		p = strstr(req, "\"age_days\":");
+		if (p) rule.age_days = (uint32_t)atoi(p + strlen("\"age_days\":"));
+
+		/* Extract min_size_bytes */
+		p = strstr(req, "\"min_size_bytes\":");
+		if (p) rule.min_size_bytes =
+			(uint64_t)strtoull(p + strlen("\"min_size_bytes\":"),
+					   NULL, 10);
+
+		/* Extract name_pattern */
+		p = strstr(req, "\"name_pattern\":\"");
+		if (p) {
+			p += strlen("\"name_pattern\":\"");
+			char *end = strchr(p, '"');
+			if (end) {
+				size_t len = (size_t)(end - p);
+				if (len >= sizeof(rule.name_pattern))
+					len = sizeof(rule.name_pattern) - 1;
+				strncpy(rule.name_pattern, p, len);
+			}
+		}
+
+		rule.readonly           = !!strstr(req, "\"readonly\":true");
+		rule.delete_after_demote = !!strstr(req, "\"delete_after_demote\":true");
+		rule.enabled            = true;
+
+		if (d->policy && rule.age_days > 0) {
+			uint64_t id = bdfs_policy_add_rule(d->policy, &rule);
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":0,\"data\":{\"rule_id\":%llu}}\n",
+				 (unsigned long long)id);
+		} else {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":"
+				 "\"invalid rule or policy engine not running\"}\n");
+		}
+
+	} else if (strstr(req, "\"policy-remove\"")) {
+		uint64_t rule_id = 0;
+		char *p = strstr(req, "\"rule_id\":");
+		if (p) rule_id = (uint64_t)strtoull(
+				p + strlen("\"rule_id\":"), NULL, 10);
+
+		if (d->policy && rule_id > 0) {
+			int r = bdfs_policy_remove_rule(d->policy, rule_id);
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d}\n", r);
+		} else {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"invalid rule_id\"}\n");
+		}
+
+	} else if (strstr(req, "\"policy-list\"")) {
+		if (d->policy) {
+			struct bdfs_policy_rule rules[64];
+			uint32_t count = 0;
+			bdfs_policy_list_rules(d->policy, rules, 64, &count);
+			char *pos = resp;
+			size_t rem = sizeof(resp);
+			int written = snprintf(pos, rem,
+				"{\"status\":0,\"data\":{\"rules\":[");
+			pos += written; rem -= written;
+			for (uint32_t i = 0; i < count && rem > 2; i++) {
+				written = snprintf(pos, rem,
+					"%s{\"id\":%llu,\"age_days\":%u,"
+					"\"pattern\":\"%s\","
+					"\"compression\":\"%s\","
+					"\"delete_after\":%s,"
+					"\"enabled\":%s}",
+					i ? "," : "",
+					(unsigned long long)rules[i].rule_id,
+					rules[i].age_days,
+					rules[i].name_pattern,
+					/* compression name not available here */
+					"zstd",
+					rules[i].delete_after_demote ? "true":"false",
+					rules[i].enabled ? "true" : "false");
+				pos += written; rem -= written;
+			}
+			snprintf(pos, rem, "]}}\n");
+		} else {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":0,\"data\":{\"rules\":[]}}\n");
+		}
+
+	} else if (strstr(req, "\"policy-scan\"")) {
+		if (d->policy) {
+			int demoted = bdfs_policy_scan(d->policy);
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":0,\"data\":"
+				 "{\"demotes_queued\":%d}}\n", demoted);
+		} else {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-1,\"error\":"
+				 "\"policy engine not running\"}\n");
+		}
+
 	} else {
 		status = -ENOSYS;
 		snprintf(resp, sizeof(resp),

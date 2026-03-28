@@ -67,6 +67,10 @@ struct bdfs_job {
 			uint32_t block_size_bits;
 			uint32_t worker_threads;
 			uint32_t flags;
+			/* Incremental export: path of the parent snapshot.
+			 * Non-empty when BDFS_EXPORT_INCREMENTAL is set.
+			 * Passed as -p <parent_snap> to btrfs-send. */
+			char    parent_snap_path[BDFS_PATH_MAX];
 		} export_to_dwarfs;
 
 		struct {
@@ -133,6 +137,9 @@ struct bdfs_daemon {
 	/* Active FUSE mounts tracked by the daemon */
 	pthread_mutex_t             mounts_lock;
 	struct bdfs_mount_table    *mounts;
+
+	/* Auto-demote policy engine (started after init) */
+	struct bdfs_policy_engine  *policy;
 };
 
 /* ── Function declarations ─────────────────────────────────────────────── */
@@ -187,6 +194,11 @@ int bdfs_exec_dwarfs_umount(struct bdfs_daemon *d,
 int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
 			 const char *subvol_path,
 			 int *pipe_read_fd_out);
+
+int bdfs_exec_btrfs_send_incremental(struct bdfs_daemon *d,
+				     const char *subvol_path,
+				     const char *parent_snap_path,
+				     int *pipe_read_fd_out);
 
 int bdfs_exec_btrfs_receive(struct bdfs_daemon *d,
 			    const char *dest_dir,

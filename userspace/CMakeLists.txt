@@ -43,6 +43,7 @@ if(BUILD_DAEMON)
         daemon/bdfs_jobs.c
         daemon/bdfs_netlink.c
         daemon/bdfs_socket.c
+        daemon/bdfs_policy.c
     )
 
     target_include_directories(bdfs_daemon PRIVATE
@@ -72,6 +73,8 @@ if(BUILD_CLI)
         cli/bdfs_mount.c
         cli/bdfs_snapshot_promote_demote.c
         cli/bdfs_status.c
+        cli/bdfs_verify.c
+        cli/bdfs_policy.c
     )
 
     target_include_directories(bdfs PRIVATE

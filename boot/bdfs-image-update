@@ -1,0 +1,174 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# bdfs-image-update - Root DwarFS image lifecycle manager
+#
+# Manages the active root image on a BDFS-booted system:
+#
+#   1. Reads /etc/bdfs/boot.conf for image location and update source.
+#   2. Optionally fetches a new image from BDFS_UPDATE_URL.
+#   3. Verifies the new image with dwarfsck.
+#   4. Rotates: current → .prev, new → current.
+#   5. Creates a BTRFS snapshot of the images subvolume for rollback.
+#   6. Writes /run/bdfs/reboot-required if the image changed.
+#
+# A reboot is required to activate a new image.  The update itself is
+# atomic: the rename(2) of the new image into place is the commit point.
+#
+# Usage:
+#   bdfs-image-update [--force] [--dry-run] [--image <path>]
+#
+# Options:
+#   --force       Apply update even if the image hash matches current
+#   --dry-run     Verify and report but do not rotate
+#   --image <p>   Use a local image file instead of fetching from URL
+
+set -euo pipefail
+
+CONF=/etc/bdfs/boot.conf
+BTRFS_PART=/run/bdfs/btrfs_part
+REBOOT_FLAG=/run/bdfs/reboot-required
+LOG_TAG="bdfs-image-update"
+
+log()  { logger -t "$LOG_TAG" "$*"; echo "$*"; }
+warn() { logger -t "$LOG_TAG" -p user.warning "WARNING: $*"; echo "WARNING: $*" >&2; }
+die()  { logger -t "$LOG_TAG" -p user.err "FATAL: $*"; echo "FATAL: $*" >&2; exit 1; }
+
+# ── Load configuration ────────────────────────────────────────────────────
+
+BDFS_IMAGE_PATH=""        # e.g. /images/system.dwarfs  (relative to BTRFS_PART)
+BDFS_UPDATE_URL=""        # e.g. https://example.com/images/system.dwarfs
+BDFS_UPDATE_CHECKSUM=""   # sha256 of the new image (optional)
+BDFS_SNAPSHOT_ON_UPDATE=1 # take BTRFS snapshot before rotating
+
+if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source <(grep -E '^(image_path|update_url|update_checksum|snapshot_on_update)' \
+             "$CONF" | sed 's/^/BDFS_/' | tr '[:lower:]' '[:upper:]' | \
+             sed 's/ *= */=/')
+fi
+
+# ── Parse arguments ───────────────────────────────────────────────────────
+
+FORCE=0
+DRY_RUN=0
+LOCAL_IMAGE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)       FORCE=1 ;;
+        --dry-run)     DRY_RUN=1 ;;
+        --image)       LOCAL_IMAGE="$2"; shift ;;
+        *) die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+# ── Validate environment ──────────────────────────────────────────────────
+
+[[ -d "$BTRFS_PART" ]] || die "BTRFS partition not mounted at $BTRFS_PART"
+[[ -n "$BDFS_IMAGE_PATH" ]] || die "image_path not set in $CONF"
+
+CURRENT_IMAGE="${BTRFS_PART}${BDFS_IMAGE_PATH}"
+PREV_IMAGE="${CURRENT_IMAGE%.dwarfs}.prev.dwarfs"
+NEW_IMAGE="${CURRENT_IMAGE%.dwarfs}.new.dwarfs"
+
+# ── Acquire or use local image ────────────────────────────────────────────
+
+if [[ -n "$LOCAL_IMAGE" ]]; then
+    log "Using local image: $LOCAL_IMAGE"
+    cp --reflink=auto "$LOCAL_IMAGE" "$NEW_IMAGE"
+
+elif [[ -n "$BDFS_UPDATE_URL" ]]; then
+    log "Fetching image from $BDFS_UPDATE_URL"
+    curl -fsSL --retry 3 --retry-delay 5 \
+         -o "$NEW_IMAGE" \
+         "$BDFS_UPDATE_URL" \
+        || die "failed to fetch image from $BDFS_UPDATE_URL"
+else
+    log "No update source configured — nothing to do"
+    exit 0
+fi
+
+# ── Verify checksum ───────────────────────────────────────────────────────
+
+if [[ -n "$BDFS_UPDATE_CHECKSUM" ]]; then
+    log "Verifying checksum..."
+    ACTUAL=$(sha256sum "$NEW_IMAGE" | awk '{print $1}')
+    if [[ "$ACTUAL" != "$BDFS_UPDATE_CHECKSUM" ]]; then
+        rm -f "$NEW_IMAGE"
+        die "checksum mismatch: expected $BDFS_UPDATE_CHECKSUM got $ACTUAL"
+    fi
+    log "Checksum OK"
+fi
+
+# ── Check if image actually changed ──────────────────────────────────────
+
+if [[ -f "$CURRENT_IMAGE" && "$FORCE" -eq 0 ]]; then
+    CURRENT_HASH=$(sha256sum "$CURRENT_IMAGE" | awk '{print $1}')
+    NEW_HASH=$(sha256sum "$NEW_IMAGE" | awk '{print $1}')
+    if [[ "$CURRENT_HASH" == "$NEW_HASH" ]]; then
+        log "Image unchanged (hash match) — no update needed"
+        rm -f "$NEW_IMAGE"
+        exit 0
+    fi
+fi
+
+# ── Verify new image with dwarfsck ────────────────────────────────────────
+
+log "Verifying new image integrity..."
+if ! dwarfsck "$NEW_IMAGE" -q; then
+    rm -f "$NEW_IMAGE"
+    die "dwarfsck failed on new image — aborting update"
+fi
+log "Image integrity OK"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Dry run: image verified, would rotate to $CURRENT_IMAGE"
+    rm -f "$NEW_IMAGE"
+    exit 0
+fi
+
+# ── BTRFS snapshot before rotation ───────────────────────────────────────
+
+if [[ "$BDFS_SNAPSHOT_ON_UPDATE" -eq 1 ]]; then
+    IMAGES_DIR=$(dirname "$CURRENT_IMAGE")
+    IMAGES_SUBVOL=$(dirname "$BDFS_IMAGE_PATH")
+    SNAP_NAME="${IMAGES_SUBVOL}_snap_$(date +%Y%m%d_%H%M%S)"
+    SNAP_PATH="${BTRFS_PART}${SNAP_NAME}"
+
+    log "Creating BTRFS snapshot: $SNAP_PATH"
+    # Remount BTRFS partition read-write for snapshot
+    mount -o remount,rw "$BTRFS_PART" 2>/dev/null || true
+    btrfs subvolume snapshot -r \
+        "${BTRFS_PART}${IMAGES_SUBVOL}" \
+        "$SNAP_PATH" 2>/dev/null \
+        && log "Snapshot created: $SNAP_PATH" \
+        || warn "Snapshot failed (non-fatal)"
+fi
+
+# ── Rotate: current → .prev, new → current ───────────────────────────────
+
+log "Rotating images..."
+
+# Remove old .prev if it exists
+[[ -f "$PREV_IMAGE" ]] && rm -f "$PREV_IMAGE"
+
+# current → .prev  (atomic rename)
+[[ -f "$CURRENT_IMAGE" ]] && mv "$CURRENT_IMAGE" "$PREV_IMAGE"
+
+# new → current  (atomic rename — this is the commit point)
+mv "$NEW_IMAGE" "$CURRENT_IMAGE"
+
+log "Image rotated: $(basename "$CURRENT_IMAGE") is now active"
+log "Previous image retained at: $(basename "$PREV_IMAGE")"
+
+# ── Signal reboot required ────────────────────────────────────────────────
+
+echo "$(date -Iseconds) image=$(basename "$CURRENT_IMAGE")" > "$REBOOT_FLAG"
+log "Reboot required to activate new image (flag: $REBOOT_FLAG)"
+
+# Optionally notify systemd
+systemd-notify --status="BDFS image updated — reboot required" 2>/dev/null || true
+
+exit 0

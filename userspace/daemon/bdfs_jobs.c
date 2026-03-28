@@ -83,8 +83,20 @@ int bdfs_job_export_to_dwarfs(struct bdfs_daemon *d, struct bdfs_job *job)
 	{
 		int pipe_fd;
 		pid_t send_pid;
+		const char *parent = NULL;
 
-		send_pid = bdfs_exec_btrfs_send(d, snap_path, &pipe_fd);
+		/*
+		 * Incremental export: pass the parent snapshot path to
+		 * btrfs-send via -p so only the delta is streamed.
+		 * The parent_snap_path field is populated by the netlink
+		 * event parser when BDFS_EXPORT_INCREMENTAL is set.
+		 */
+		if ((j->export_to_dwarfs.flags & BDFS_EXPORT_INCREMENTAL) &&
+		    j->export_to_dwarfs.parent_snap_path[0])
+			parent = j->export_to_dwarfs.parent_snap_path;
+
+		send_pid = bdfs_exec_btrfs_send_incremental(d, snap_path,
+							    parent, &pipe_fd);
 		if (send_pid < 0) {
 			syslog(LOG_ERR, "bdfs: export: btrfs send failed: %d",
 			       send_pid);
@@ -199,11 +211,22 @@ int bdfs_job_import_from_dwarfs(struct bdfs_daemon *d, struct bdfs_job *job)
 	 */
 	if (j->import_from_dwarfs.flags & BDFS_IMPORT_READONLY) {
 		const char *argv[] = {
-			"btrfs", "property", "set",
+			d->cfg.btrfs_bin, "property", "set",
 			"-ts", subvol_path, "ro", "true", NULL
 		};
-		/* best-effort; non-fatal if it fails */
-		(void)argv;
+		ret = bdfs_exec_wait(argv);
+		if (ret) {
+			syslog(LOG_WARNING,
+			       "bdfs: import: failed to set subvol ro on %s: %d"
+			       " (subvol created but not read-only)",
+			       subvol_path, ret);
+			/* Non-fatal: the data was imported successfully;
+			 * the caller can set ro manually via btrfs-progs. */
+			ret = 0;
+		} else {
+			syslog(LOG_INFO, "bdfs: import: subvol %s set read-only",
+			       subvol_path);
+		}
 	}
 
 	syslog(LOG_INFO, "bdfs: import complete: %s → subvol %s",

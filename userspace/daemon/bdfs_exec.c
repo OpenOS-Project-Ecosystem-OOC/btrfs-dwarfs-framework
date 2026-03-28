@@ -199,6 +199,27 @@ int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
 			 const char *subvol_path,
 			 int *pipe_read_fd_out)
 {
+	return bdfs_exec_btrfs_send_incremental(d, subvol_path, NULL,
+						pipe_read_fd_out);
+}
+
+/*
+ * bdfs_exec_btrfs_send_incremental - Start a `btrfs send` process, optionally
+ * with a parent snapshot for incremental sends.
+ *
+ * When parent_snap_path is non-NULL and non-empty, passes `-p <parent>` to
+ * btrfs-send, producing a delta stream relative to the parent snapshot.
+ * This dramatically reduces the size of the send stream (and therefore the
+ * resulting DwarFS image) when only a small portion of the subvolume changed.
+ *
+ * Equivalent to:
+ *   btrfs send [-p <parent_snap>] <subvol_path>   (stdout → pipe)
+ */
+int bdfs_exec_btrfs_send_incremental(struct bdfs_daemon *d,
+				     const char *subvol_path,
+				     const char *parent_snap_path,
+				     int *pipe_read_fd_out)
+{
 	int pipefd[2];
 	pid_t pid;
 
@@ -213,20 +234,31 @@ int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
 	}
 
 	if (pid == 0) {
-		/* Child: write send stream to pipe write end */
 		close(pipefd[0]);
 		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
 
-		execlp(d->cfg.btrfs_bin, "btrfs", "send", subvol_path, NULL);
+		if (parent_snap_path && parent_snap_path[0]) {
+			execlp(d->cfg.btrfs_bin, "btrfs", "send",
+			       "-p", parent_snap_path,
+			       subvol_path, NULL);
+		} else {
+			execlp(d->cfg.btrfs_bin, "btrfs", "send",
+			       subvol_path, NULL);
+		}
 		_exit(127);
 	}
 
-	/* Parent: return read end */
 	close(pipefd[1]);
 	*pipe_read_fd_out = pipefd[0];
 
-	syslog(LOG_INFO, "bdfs: btrfs send %s (pid=%d)", subvol_path, pid);
+	if (parent_snap_path && parent_snap_path[0])
+		syslog(LOG_INFO, "bdfs: btrfs send -p %s %s (pid=%d)",
+		       parent_snap_path, subvol_path, pid);
+	else
+		syslog(LOG_INFO, "bdfs: btrfs send %s (pid=%d)",
+		       subvol_path, pid);
+
 	return (int)pid;
 }
 

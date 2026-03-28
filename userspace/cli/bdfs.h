@@ -63,6 +63,15 @@ int cmd_blend_umount(struct bdfs_cli *cli, int argc, char *argv[]);
 /* status */
 int cmd_status(struct bdfs_cli *cli, int argc, char *argv[]);
 
+/* verify */
+int cmd_verify(struct bdfs_cli *cli, int argc, char *argv[]);
+
+/* policy subcommands */
+int cmd_policy_add(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_policy_remove(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_policy_list(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_policy_scan(struct bdfs_cli *cli, int argc, char *argv[]);
+
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
 int  bdfs_cli_open_ctl(struct bdfs_cli *cli);
