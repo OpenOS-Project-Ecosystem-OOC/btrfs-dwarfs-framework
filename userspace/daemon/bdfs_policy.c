@@ -156,14 +156,23 @@ static uint64_t btrfs_qgroup_exclusive(int fd, uint64_t subvol_id)
 
 #endif /* HAVE_BTRFS_IOCTL */
 
+/*
+ * Thread-safe directory walk size accumulator.
+ *
+ * nftw(3) does not support a user-data pointer, so we use a thread-local
+ * variable instead of a global.  Each call to subvol_size_bytes_walk()
+ * resets the thread-local counter before starting the walk, so concurrent
+ * calls from different policy scan threads accumulate independently.
+ */
 #include <ftw.h>
-static uint64_t g_walk_bytes;
+static __thread uint64_t tl_walk_bytes;
+
 static int walk_add_size(const char *fpath, const struct stat *sb,
 			 int typeflag, struct FTW *ftwbuf)
 {
 	(void)fpath; (void)typeflag; (void)ftwbuf;
 	if (S_ISREG(sb->st_mode))
-		g_walk_bytes += (uint64_t)sb->st_blocks * 512;
+		tl_walk_bytes += (uint64_t)sb->st_blocks * 512;
 	return 0;
 }
 
@@ -183,10 +192,10 @@ static uint64_t subvol_size_bytes(const char *path)
 		}
 	}
 #endif
-	/* Fallback: directory walk */
-	g_walk_bytes = 0;
+	/* Fallback: thread-local directory walk */
+	tl_walk_bytes = 0;
 	nftw(path, walk_add_size, 64, FTW_PHYS | FTW_MOUNT);
-	return g_walk_bytes;
+	return tl_walk_bytes;
 }
 
 /* ── Rule matching ───────────────────────────────────────────────────────── */

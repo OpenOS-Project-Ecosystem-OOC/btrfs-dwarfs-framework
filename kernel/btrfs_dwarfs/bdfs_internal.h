@@ -112,6 +112,14 @@ void bdfs_blend_complete_copyup(struct inode *inode,
  */
 struct inode *bdfs_copyup_lookup_and_remove(const u8 uuid[16], u64 ino);
 
+/*
+ * Resolve a blend-namespace path to its real backing layer path.
+ * Fills bdfs_ioctl_resolve_path.layer and .real_path.
+ */
+int bdfs_resolve_path(void __user *uarg,
+		      struct list_head *registry,
+		      struct mutex *lock);
+
 /* ── Partition list helpers (bdfs_main.c) ────────────────────────────── */
 
 int bdfs_list_partitions(void __user *uarg,

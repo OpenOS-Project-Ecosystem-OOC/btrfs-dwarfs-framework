@@ -198,6 +198,13 @@ struct bdfs_blend_inode_info {
 	struct path     real_path;      /* path on the backing layer */
 	bool            is_upper;       /* true = BTRFS, false = DwarFS lower */
 	atomic_t        copyup_done;    /* set to 1 when daemon finishes copy-up */
+	/*
+	 * Cached open file for the upper-layer backing file.
+	 * Populated on first write; avoids a dentry_open() per write_iter call.
+	 * Protected by the inode's i_rwsem (held by the VFS for writes).
+	 * Dropped in bdfs_blend_free_inode().
+	 */
+	struct file    *upper_file;
 };
 
 static inline struct bdfs_blend_inode_info *
@@ -214,7 +221,8 @@ static struct inode *bdfs_blend_alloc_inode(struct super_block *sb)
 	if (!bi)
 		return NULL;
 	memset(&bi->real_path, 0, sizeof(bi->real_path));
-	bi->is_upper = false;
+	bi->is_upper   = false;
+	bi->upper_file = NULL;
 	atomic_set(&bi->copyup_done, 0);
 	return &bi->vfs_inode;
 }
@@ -222,6 +230,10 @@ static struct inode *bdfs_blend_alloc_inode(struct super_block *sb)
 static void bdfs_blend_free_inode(struct inode *inode)
 {
 	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	if (bi->upper_file) {
+		fput(bi->upper_file);
+		bi->upper_file = NULL;
+	}
 	path_put(&bi->real_path);
 	kmem_cache_free(bdfs_inode_cachep, bi);
 }
@@ -270,12 +282,58 @@ static struct inode *bdfs_blend_make_inode(struct super_block *sb,
 	inode->i_ctime = real->i_ctime;
 	set_nlink(inode, real->i_nlink);
 
-	if (S_ISDIR(inode->i_mode))
-		inode->i_op = &bdfs_blend_dir_iops;
-	else if (S_ISREG(inode->i_mode))
-		inode->i_op = &bdfs_blend_file_iops;
+	if (S_ISDIR(inode->i_mode)) {
+		inode->i_op  = &bdfs_blend_dir_iops;
+		inode->i_fop = &bdfs_blend_dir_fops;
+	} else if (S_ISREG(inode->i_mode)) {
+		inode->i_op  = &bdfs_blend_file_iops;
+		inode->i_fop = &bdfs_blend_file_fops;
+	} else if (S_ISLNK(inode->i_mode)) {
+		inode->i_op  = &bdfs_blend_symlink_iops;
+		/* symlinks have no file_operations */
+	} else {
+		/* Special files (devices, fifos, sockets): forward to real */
+		init_special_inode(inode, inode->i_mode, real->i_rdev);
+	}
 
 	return inode;
+}
+
+/*
+ * bdfs_blend_rel_path - Build the path of @dentry relative to the blend root.
+ *
+ * Walks the dentry parent chain up to the blend superblock root, collecting
+ * component names, then assembles them into a slash-separated string in @buf.
+ * Returns a pointer into @buf on success, or ERR_PTR on error.
+ *
+ * Example: for blend root "/" and dentry at "a/b/c", returns "a/b/c".
+ */
+static char *bdfs_blend_rel_path(struct dentry *dentry, char *buf, size_t bufsz)
+{
+	/* Walk up to the root collecting names */
+	struct dentry *d = dentry;
+	char *p = buf + bufsz - 1;
+	*p = '\0';
+
+	while (!IS_ROOT(d)) {
+		const char *name = d->d_name.name;
+		size_t len = d->d_name.len;
+
+		if (p - buf < (ptrdiff_t)(len + 1))
+			return ERR_PTR(-ENAMETOOLONG);
+
+		p -= len;
+		memcpy(p, name, len);
+		p--;
+		*p = '/';
+		d = d->d_parent;
+	}
+
+	/* p now points at the leading '/' — skip it */
+	if (*p == '/')
+		p++;
+
+	return p;
 }
 
 /*
@@ -285,9 +343,11 @@ static struct inode *bdfs_blend_make_inode(struct super_block *sb,
  *   1. BTRFS upper layer  (writable; takes precedence on name collision)
  *   2. DwarFS lower layers in priority order (read-only compressed archives)
  *
- * For each layer we use vfs_path_lookup() to resolve the name relative to
- * that layer's root, then wrap the result in a blend inode so the VFS sees
- * a consistent namespace.
+ * For each layer we use vfs_path_lookup() to resolve the FULL relative path
+ * from the layer root to the child being looked up.  This correctly handles
+ * nested directories: "a/b/c" is resolved as a single lookup from the layer
+ * root rather than just resolving "c" relative to the layer root (which would
+ * only work for top-level entries).
  *
  * Copy-up on write is handled at the file_operations level: any write to a
  * blend inode backed by a DwarFS lower layer triggers a copy-up to the BTRFS
@@ -305,23 +365,51 @@ static struct dentry *bdfs_blend_lookup(struct inode *dir,
 	struct inode *new_inode;
 	struct dentry *new_dentry;
 	const char *name = dentry->d_name.name;
+	/* Full relative path buffer — used for lower-layer lookups */
+	char *relpath_buf;
+	char *relpath;
 	int err;
+
+	/*
+	 * Build the full relative path for this dentry (e.g. "usr/lib/foo.so").
+	 * We need this for lower-layer lookups so that nested directories are
+	 * resolved correctly from the layer root rather than just by name.
+	 */
+	relpath_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!relpath_buf)
+		return ERR_PTR(-ENOMEM);
+
+	relpath = bdfs_blend_rel_path(dentry, relpath_buf, PATH_MAX);
+	if (IS_ERR(relpath)) {
+		kfree(relpath_buf);
+		return ERR_CAST(relpath);
+	}
 
 	/*
 	 * Step 1: Try the BTRFS upper layer.
 	 *
-	 * We resolve the name relative to the parent's real path on the upper
-	 * layer.  If the parent itself is from a lower layer (DwarFS), we
-	 * redirect to the corresponding path on the BTRFS upper root.
+	 * If the parent is already on the upper layer, resolve relative to it
+	 * (single component lookup — fast path).  If the parent is from a
+	 * lower layer, resolve the full relative path from the BTRFS root so
+	 * we find any upper-layer override at any depth.
 	 */
-	if (bm->btrfs_mnt && (parent_bi->is_upper ||
-	    parent_real.mnt == bm->btrfs_mnt)) {
-		err = vfs_path_lookup(parent_real.dentry, parent_real.mnt,
-				      name, 0, &child_path);
+	if (bm->btrfs_mnt) {
+		if (parent_bi->is_upper) {
+			/* Fast path: parent is already on upper layer */
+			err = vfs_path_lookup(parent_real.dentry,
+					      parent_real.mnt,
+					      name, 0, &child_path);
+		} else {
+			/* Full path from BTRFS root */
+			err = vfs_path_lookup(bm->btrfs_mnt->mnt_root,
+					      bm->btrfs_mnt,
+					      relpath, 0, &child_path);
+		}
 		if (!err && d_is_positive(child_path.dentry)) {
 			new_inode = bdfs_blend_make_inode(sb, &child_path,
 							  true);
 			path_put(&child_path);
+			kfree(relpath_buf);
 			if (!new_inode)
 				return ERR_PTR(-ENOMEM);
 			new_dentry = d_splice_alias(new_inode, dentry);
@@ -334,9 +422,9 @@ static struct dentry *bdfs_blend_lookup(struct inode *dir,
 	/*
 	 * Step 2: Fall through to DwarFS lower layers in priority order.
 	 *
-	 * Each lower layer is a FUSE vfsmount.  We resolve the name relative
-	 * to the layer's root, constructing the full path from the blend
-	 * mount point down to the current directory.
+	 * Resolve the full relative path from each layer's root so that
+	 * nested directories (e.g. "usr/lib/foo.so") are found correctly
+	 * regardless of how deep the current directory is.
 	 */
 	{
 		struct bdfs_dwarfs_layer *layer;
@@ -346,12 +434,13 @@ static struct dentry *bdfs_blend_lookup(struct inode *dir,
 				continue;
 
 			err = vfs_path_lookup(layer->mnt->mnt_root,
-					      layer->mnt, name, 0,
+					      layer->mnt, relpath, 0,
 					      &child_path);
 			if (!err && d_is_positive(child_path.dentry)) {
 				new_inode = bdfs_blend_make_inode(
 						sb, &child_path, false);
 				path_put(&child_path);
+				kfree(relpath_buf);
 				if (!new_inode)
 					return ERR_PTR(-ENOMEM);
 				new_dentry = d_splice_alias(new_inode, dentry);
@@ -363,6 +452,7 @@ static struct dentry *bdfs_blend_lookup(struct inode *dir,
 	}
 
 	/* Not found in any layer — return a negative dentry */
+	kfree(relpath_buf);
 	d_add(dentry, NULL);
 	return NULL;
 }
@@ -568,44 +658,6 @@ static int bdfs_blend_open(struct inode *inode, struct file *file)
 	}
 
 	return finish_open(file, bi->real_path.dentry, generic_file_open);
-}
-
-/*
- * bdfs_blend_write_iter - Forward writes to the BTRFS upper layer.
- *
- * Reads are served from whichever layer holds the file (upper or lower).
- * Writes always go to the upper layer; copy-up has already been performed
- * by bdfs_blend_open() before we reach here.
- */
-static ssize_t bdfs_blend_write_iter(struct kiocb *iocb, struct iov_iter *iter)
-{
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
-	struct file *real_file;
-	ssize_t ret;
-
-	if (!bi->is_upper)
-		return -EROFS;
-
-	/*
-	 * Open the real upper-layer file and proxy the write through it.
-	 * We use a temporary file reference so the real filesystem's
-	 * write_iter (BTRFS) handles locking, journalling, and CoW.
-	 */
-	real_file = dentry_open(&bi->real_path, file->f_flags, current_cred());
-	if (IS_ERR(real_file))
-		return PTR_ERR(real_file);
-
-	iocb->ki_filp = real_file;
-	ret = real_file->f_op->write_iter(iocb, iter);
-	iocb->ki_filp = file;
-
-	/* Sync size back to the blend inode */
-	inode->i_size = file_inode(real_file)->i_size;
-
-	fput(real_file);
-	return ret;
 }
 
 /* ── Directory write operations ──────────────────────────────────────────── */
@@ -965,9 +1017,216 @@ void bdfs_blend_complete_copyup(struct inode *inode,
 }
 EXPORT_SYMBOL_GPL(bdfs_blend_complete_copyup);
 
+/* ── Xattr forwarding ────────────────────────────────────────────────────── */
+
+/*
+ * Forward xattr operations to the real backing inode.
+ * For upper-layer inodes this reaches BTRFS; for lower-layer inodes it
+ * reaches the DwarFS FUSE handler (which may return -ENOTSUP for setxattr).
+ */
+static ssize_t bdfs_blend_listxattr(struct dentry *dentry, char *list,
+				    size_t size)
+{
+	struct inode *inode = d_inode(dentry);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+
+	if (!bi->real_path.dentry)
+		return -EIO;
+
+	return vfs_listxattr(bi->real_path.dentry, list, size);
+}
+
+/* ── Symlink forwarding ──────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_get_link - Return the symlink target from the backing layer.
+ *
+ * We delegate to the real inode's get_link so that path resolution through
+ * symlinks in the blend namespace works correctly.
+ */
+static const char *bdfs_blend_get_link(struct dentry *dentry,
+				       struct inode *inode,
+				       struct delayed_call *done)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct inode *real;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD); /* RCU lookup not supported */
+
+	if (!bi->real_path.dentry)
+		return ERR_PTR(-EIO);
+
+	real = d_inode(bi->real_path.dentry);
+	if (!real->i_op || !real->i_op->get_link)
+		return ERR_PTR(-EINVAL);
+
+	return real->i_op->get_link(bi->real_path.dentry, real, done);
+}
+
+/* ── Directory readdir ───────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_iterate_shared - Enumerate directory entries from both layers.
+ *
+ * We iterate the BTRFS upper layer first, then each DwarFS lower layer.
+ * Entries that already appeared in the upper layer are deduplicated by
+ * tracking emitted names in a small hash set.  For simplicity we use a
+ * fixed-size bitmap over a hash of the name; false positives (suppressing
+ * a lower-layer entry that happens to hash-collide with an upper entry) are
+ * acceptable — the entry is still accessible via lookup.
+ *
+ * The real directory is opened via dentry_open() and iterated with
+ * iterate_dir(), which calls the backing filesystem's iterate_shared.
+ */
+
+#define BDFS_DEDUP_BITS  512   /* power of two; covers ~360 entries at 50% */
+#define BDFS_DEDUP_MASK  (BDFS_DEDUP_BITS - 1)
+
+struct bdfs_readdir_ctx {
+	struct dir_context  ctx;
+	struct dir_context *caller_ctx;
+	unsigned long       seen[BDFS_DEDUP_BITS / BITS_PER_LONG];
+	bool                dedup; /* true = skip names already in seen[] */
+};
+
+static bool bdfs_dedup_test_set(struct bdfs_readdir_ctx *rc,
+				const char *name, int namlen)
+{
+	unsigned long h = full_name_hash(NULL, name, namlen) & BDFS_DEDUP_MASK;
+	bool already = test_bit(h, rc->seen);
+	set_bit(h, rc->seen);
+	return already;
+}
+
+static bool bdfs_filldir(struct dir_context *ctx, const char *name, int namlen,
+			 loff_t offset, u64 ino, unsigned int d_type)
+{
+	struct bdfs_readdir_ctx *rc =
+		container_of(ctx, struct bdfs_readdir_ctx, ctx);
+
+	if (rc->dedup && bdfs_dedup_test_set(rc, name, namlen))
+		return true; /* skip duplicate; continue iteration */
+
+	if (!rc->dedup)
+		bdfs_dedup_test_set(rc, name, namlen); /* record for lower pass */
+
+	return dir_emit(rc->caller_ctx, name, namlen, ino, d_type);
+}
+
+static int bdfs_blend_iterate_shared(struct file *file,
+				     struct dir_context *caller_ctx)
+{
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct bdfs_readdir_ctx rc;
+	struct file *real_file;
+	struct bdfs_dwarfs_layer *layer;
+	int ret = 0;
+
+	memset(&rc, 0, sizeof(rc));
+	rc.ctx.actor  = bdfs_filldir;
+	rc.ctx.pos    = caller_ctx->pos;
+	rc.caller_ctx = caller_ctx;
+	rc.dedup      = false; /* first pass: record names */
+
+	/* Pass 1: BTRFS upper layer */
+	if (bm && bm->btrfs_mnt && bi->real_path.dentry) {
+		real_file = dentry_open(&bi->real_path,
+					O_RDONLY | O_DIRECTORY,
+					current_cred());
+		if (!IS_ERR(real_file)) {
+			ret = iterate_dir(real_file, &rc.ctx);
+			fput(real_file);
+		}
+	}
+
+	/* Pass 2: DwarFS lower layers — skip names seen in upper */
+	rc.dedup = true;
+	if (bm) {
+		list_for_each_entry(layer, &bm->dwarfs_layers, list) {
+			struct path lower_path;
+			int err;
+
+			if (!layer->mnt)
+				continue;
+
+			/* Resolve the same relative path on the lower layer */
+			err = vfs_path_lookup(layer->mnt->mnt_root,
+					      layer->mnt,
+					      bi->real_path.dentry->d_name.name,
+					      0, &lower_path);
+			if (err)
+				continue;
+
+			real_file = dentry_open(&lower_path,
+						O_RDONLY | O_DIRECTORY,
+						current_cred());
+			path_put(&lower_path);
+			if (IS_ERR(real_file))
+				continue;
+
+			rc.ctx.pos = 0;
+			iterate_dir(real_file, &rc.ctx);
+			fput(real_file);
+		}
+	}
+
+	caller_ctx->pos = rc.ctx.pos;
+	return ret;
+}
+
+/* ── Cached write_iter ───────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_write_iter - Forward writes to the BTRFS upper layer.
+ *
+ * The upper-layer file is opened once and cached in bi->upper_file.
+ * Subsequent writes reuse the cached file, avoiding a dentry_open() per call.
+ * The cache is invalidated (and the file closed) in bdfs_blend_free_inode().
+ */
+static ssize_t bdfs_blend_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	ssize_t ret;
+
+	if (!bi->is_upper)
+		return -EROFS;
+
+	/* Open and cache the upper-layer file on first write */
+	if (!bi->upper_file) {
+		struct file *uf = dentry_open(&bi->real_path,
+					      O_RDWR | O_LARGEFILE,
+					      current_cred());
+		if (IS_ERR(uf))
+			return PTR_ERR(uf);
+		bi->upper_file = uf;
+	}
+
+	iocb->ki_filp = bi->upper_file;
+	ret = bi->upper_file->f_op->write_iter(iocb, iter);
+	iocb->ki_filp = file;
+
+	/* Sync size back to the blend inode */
+	inode->i_size = file_inode(bi->upper_file)->i_size;
+	return ret;
+}
+
+/* ── inode_operations / file_operations tables ───────────────────────────── */
+
+static const struct inode_operations bdfs_blend_symlink_iops = {
+	.get_link  = bdfs_blend_get_link,
+	.getattr   = bdfs_blend_getattr,
+};
+
 static const struct inode_operations bdfs_blend_file_iops = {
-	.getattr  = bdfs_blend_getattr,
-	.setattr  = bdfs_blend_setattr,
+	.getattr      = bdfs_blend_getattr,
+	.setattr      = bdfs_blend_setattr,
+	.listxattr    = bdfs_blend_listxattr,
 };
 
 static const struct file_operations bdfs_blend_file_fops = {
@@ -978,17 +1237,23 @@ static const struct file_operations bdfs_blend_file_fops = {
 	.fsync      = generic_file_fsync,
 };
 
+static const struct file_operations bdfs_blend_dir_fops = {
+	.iterate_shared = bdfs_blend_iterate_shared,
+	.llseek         = generic_file_llseek,
+};
+
 static const struct inode_operations bdfs_blend_dir_iops = {
-	.lookup  = bdfs_blend_lookup,
-	.getattr = bdfs_blend_getattr,
-	.setattr = bdfs_blend_setattr,
-	.create  = bdfs_blend_create,
-	.mkdir   = bdfs_blend_mkdir,
-	.unlink  = bdfs_blend_unlink,
-	.rmdir   = bdfs_blend_rmdir,
-	.rename  = bdfs_blend_rename,
-	.symlink = bdfs_blend_symlink,
-	.link    = bdfs_blend_link,
+	.lookup      = bdfs_blend_lookup,
+	.getattr     = bdfs_blend_getattr,
+	.setattr     = bdfs_blend_setattr,
+	.listxattr   = bdfs_blend_listxattr,
+	.create      = bdfs_blend_create,
+	.mkdir       = bdfs_blend_mkdir,
+	.unlink      = bdfs_blend_unlink,
+	.rmdir       = bdfs_blend_rmdir,
+	.rename      = bdfs_blend_rename,
+	.symlink     = bdfs_blend_symlink,
+	.link        = bdfs_blend_link,
 };
 
 /* ── Filesystem type registration ───────────────────────────────────────── */
@@ -1000,16 +1265,18 @@ static int bdfs_blend_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct dentry *root_dentry;
 
 	sb->s_magic = BDFS_BLEND_MAGIC;
-	sb->s_op = &bdfs_blend_sops;
+	sb->s_op    = &bdfs_blend_sops;
 	sb->s_fs_info = bm;
+	bm->sb = sb;   /* back-pointer so bdfs_blend_umount can deactivate_super */
 
 	root_inode = new_inode(sb);
 	if (!root_inode)
 		return -ENOMEM;
 
-	root_inode->i_ino = 1;
+	root_inode->i_ino  = 1;
 	root_inode->i_mode = S_IFDIR | 0755;
-	root_inode->i_op = &bdfs_blend_dir_iops;
+	root_inode->i_op   = &bdfs_blend_dir_iops;
+	root_inode->i_fop  = &bdfs_blend_dir_fops;
 	set_nlink(root_inode, 2);
 
 	root_dentry = d_make_root(root_inode);
@@ -1089,6 +1356,8 @@ int bdfs_blend_umount(void __user *uarg)
 {
 	struct bdfs_ioctl_umount_blend arg;
 	struct bdfs_blend_mount *bm, *tmp;
+	struct super_block *sb_to_deactivate = NULL;
+	struct bdfs_dwarfs_layer *layer, *ltmp;
 	bool found = false;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
@@ -1096,18 +1365,147 @@ int bdfs_blend_umount(void __user *uarg)
 
 	mutex_lock(&bdfs_blend_mounts_lock);
 	list_for_each_entry_safe(bm, tmp, &bdfs_blend_mounts, list) {
-		if (strcmp(bm->mount_point, arg.mount_point) == 0) {
-			list_del(&bm->list);
-			found = true;
-			bdfs_emit_event(BDFS_EVT_BLEND_UNMOUNTED,
-					bm->btrfs_uuid, 0, arg.mount_point);
-			kfree(bm);
-			break;
+		if (strcmp(bm->mount_point, arg.mount_point) != 0)
+			continue;
+
+		list_del(&bm->list);
+		found = true;
+
+		bdfs_emit_event(BDFS_EVT_BLEND_UNMOUNTED,
+				bm->btrfs_uuid, 0, arg.mount_point);
+
+		/*
+		 * Save the superblock pointer so we can call
+		 * deactivate_super() after dropping the lock.
+		 * deactivate_super() may sleep and must not be called
+		 * under a mutex.
+		 */
+		sb_to_deactivate = bm->sb;
+
+		/* Release BTRFS upper-layer mount reference */
+		if (bm->btrfs_mnt) {
+			mntput(bm->btrfs_mnt);
+			bm->btrfs_mnt = NULL;
 		}
+
+		/* Release DwarFS lower-layer mount references */
+		list_for_each_entry_safe(layer, ltmp,
+					 &bm->dwarfs_layers, list) {
+			list_del(&layer->list);
+			if (layer->mnt)
+				mntput(layer->mnt);
+			kfree(layer);
+		}
+
+		kfree(bm);
+		break;
 	}
 	mutex_unlock(&bdfs_blend_mounts_lock);
 
-	return found ? 0 : -ENOENT;
+	if (!found)
+		return -ENOENT;
+
+	/*
+	 * Deactivate the blend superblock.  This drops the active reference
+	 * taken in bdfs_blend_mount() via get_tree_nodev(), allowing the VFS
+	 * to evict all inodes and free the superblock when the last user
+	 * releases it.
+	 */
+	if (sb_to_deactivate)
+		deactivate_super(sb_to_deactivate);
+
+	return 0;
+}
+
+/* ── BDFS_IOC_RESOLVE_PATH ──────────────────────────────────────────────── */
+
+/*
+ * bdfs_resolve_path - Resolve a blend-namespace path to its backing layer.
+ *
+ * Walks the blend mount list to find the mount whose mount_point is a prefix
+ * of the requested path, then determines whether the path resolves to the
+ * BTRFS upper layer or a DwarFS lower layer by attempting vfs_path_lookup on
+ * each in priority order.
+ *
+ * Fills bdfs_ioctl_resolve_path.layer (BDFS_LAYER_UPPER / BDFS_LAYER_LOWER)
+ * and .real_path with the resolved backing path.
+ */
+int bdfs_resolve_path(void __user *uarg,
+		      struct list_head *registry,
+		      struct mutex *lock)
+{
+	struct bdfs_ioctl_resolve_path arg;
+	struct bdfs_blend_mount *bm;
+	struct path resolved;
+	bool found = false;
+	int ret = -ENOENT;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	mutex_lock(&bdfs_blend_mounts_lock);
+	list_for_each_entry(bm, &bdfs_blend_mounts, list) {
+		size_t mlen = strlen(bm->mount_point);
+		if (strncmp(arg.path, bm->mount_point, mlen) != 0)
+			continue;
+
+		/* Relative path within the blend mount */
+		const char *rel = arg.path + mlen;
+		if (*rel == '/')
+			rel++;
+
+		/* Try BTRFS upper layer first */
+		ret = vfs_path_lookup(bm->btrfs_mnt->mnt_root,
+				      bm->btrfs_mnt, rel, 0, &resolved);
+		if (ret == 0) {
+			arg.layer = BDFS_LAYER_UPPER;
+			found = true;
+			break;
+		}
+
+		/* Try each DwarFS lower layer */
+		struct bdfs_dwarfs_layer *layer;
+		list_for_each_entry(layer, &bm->dwarfs_layers, list) {
+			if (!layer->mnt)
+				continue;
+			ret = vfs_path_lookup(layer->mnt->mnt_root,
+					      layer->mnt, rel, 0, &resolved);
+			if (ret == 0) {
+				arg.layer = BDFS_LAYER_LOWER;
+				found = true;
+				break;
+			}
+		}
+		if (found)
+			break;
+	}
+	mutex_unlock(&bdfs_blend_mounts_lock);
+
+	if (!found)
+		return ret;
+
+	/* Write the real path back to userspace */
+	{
+		char *buf = kmalloc(BDFS_PATH_MAX, GFP_KERNEL);
+		if (!buf) {
+			path_put(&resolved);
+			return -ENOMEM;
+		}
+		char *p = d_path(&resolved, buf, BDFS_PATH_MAX);
+		if (IS_ERR(p)) {
+			kfree(buf);
+			path_put(&resolved);
+			return PTR_ERR(p);
+		}
+		strncpy(arg.real_path, p, sizeof(arg.real_path) - 1);
+		kfree(buf);
+		path_put(&resolved);
+	}
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+
+	return 0;
 }
 
 /* ── Blend layer partition ops vtable ───────────────────────────────────── */
