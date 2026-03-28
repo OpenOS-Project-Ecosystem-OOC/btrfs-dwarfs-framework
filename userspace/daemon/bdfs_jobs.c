@@ -414,12 +414,29 @@ int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job)
 	char parent[BDFS_PATH_MAX];
 	char *slash;
 
-	/* Step 1: ensure parent directory exists on upper layer */
+	/*
+	 * Step 1: ensure the full parent directory tree exists on the upper
+	 * layer.  A single mkdir(2) is not sufficient for nested paths like
+	 * "/upper/usr/lib/" when intermediate components are missing.  Walk
+	 * each component and create it if absent (mkdir -p semantics).
+	 */
 	snprintf(parent, sizeof(parent), "%s", dst);
 	slash = strrchr(parent, '/');
 	if (slash && slash != parent) {
 		*slash = '\0';
-		/* mkdir -p equivalent: ignore EEXIST */
+		/* Recreate every component from the root down */
+		for (char *p = parent + 1; *p; p++) {
+			if (*p != '/')
+				continue;
+			*p = '\0';
+			if (mkdir(parent, 0755) < 0 && errno != EEXIST) {
+				syslog(LOG_ERR,
+				       "bdfs: copyup: mkdir %s: %m", parent);
+				return -errno;
+			}
+			*p = '/';
+		}
+		/* Create the final component */
 		if (mkdir(parent, 0755) < 0 && errno != EEXIST) {
 			syslog(LOG_ERR, "bdfs: copyup: mkdir %s: %m", parent);
 			return -errno;

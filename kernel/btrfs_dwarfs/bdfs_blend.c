@@ -144,13 +144,20 @@ static int bdfs_blend_statfs(struct dentry *dentry, struct kstatfs *buf)
 	 */
 	struct super_block *sb = dentry->d_sb;
 	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct path btrfs_root;
 	int ret;
 
 	if (!bm || !bm->btrfs_mnt)
 		return -EIO;
 
-	ret = vfs_statfs(&bm->btrfs_mnt->mnt_root->d_sb->s_root->d_sb->s_root,
-			 buf);
+	/*
+	 * Pass the BTRFS mount root directly.  The previous code chained
+	 * mnt_root->d_sb->s_root->d_sb->s_root which double-dereferenced
+	 * through the superblock and produced a stale or wrong dentry.
+	 */
+	btrfs_root.mnt    = bm->btrfs_mnt;
+	btrfs_root.dentry = bm->btrfs_mnt->mnt_root;
+	ret = vfs_statfs(&btrfs_root, buf);
 	buf->f_type = BDFS_BLEND_MAGIC;
 	return ret;
 }
@@ -528,32 +535,39 @@ static int bdfs_blend_trigger_copyup(struct inode *inode,
 	 * Message format:
 	 *   "copyup_needed lower=<lower_path> upper=<upper_path>"
 	 *
-	 * lower_path: the real path on the DwarFS FUSE mount (bi->real_path).
-	 * upper_path: the corresponding path on the BTRFS upper layer, derived
-	 *             by replacing the DwarFS mount root with the BTRFS root.
+	 * lower_path: the absolute path of the file on the DwarFS FUSE mount.
+	 * upper_path: the corresponding absolute path on the BTRFS upper layer.
 	 *
-	 * We build the upper path by taking the dentry name relative to the
-	 * DwarFS layer root and appending it to the BTRFS upper mount root.
-	 * For the common case (single-level path) this is exact; for nested
-	 * paths the daemon must walk the dentry chain — we pass the full
-	 * dentry path via d_path() for both layers.
+	 * The upper path is derived by:
+	 *   1. Resolving the absolute path of the BTRFS upper mount root via
+	 *      d_path().
+	 *   2. Building the relative path from the DwarFS layer root to this
+	 *      inode via bdfs_blend_rel_path() — this gives the full nested
+	 *      path (e.g. "usr/lib/foo.so"), not just the basename.
+	 *   3. Concatenating: upper = btrfs_root_abs + "/" + rel_path.
+	 *
+	 * Using only the basename (strrchr) was wrong for nested paths: a file
+	 * at "usr/lib/foo.so" would have been placed at the BTRFS root as
+	 * "foo.so" instead of "usr/lib/foo.so".
 	 */
 	{
 		char lower_buf[256] = {0};
 		char upper_buf[256] = {0};
 		char msg[sizeof(((struct bdfs_event *)0)->message)];
 
-		/* Resolve the real lower path */
+		/* Resolve the absolute lower path on the DwarFS FUSE mount */
 		if (bi->real_path.dentry && bi->real_path.mnt) {
 			char *p = d_path(&bi->real_path, lower_buf,
 					 sizeof(lower_buf));
 			if (!IS_ERR(p))
-				memmove(lower_buf, p,
-					strlen(p) + 1);
+				memmove(lower_buf, p, strlen(p) + 1);
 		}
 
-		/* Derive the upper path: same relative path under BTRFS root */
-		if (bm->btrfs_mnt && lower_buf[0]) {
+		/*
+		 * Derive the upper path using the full relative path from the
+		 * blend root to this inode, not just the final name component.
+		 */
+		if (bm->btrfs_mnt) {
 			struct path btrfs_root = {
 				.mnt    = bm->btrfs_mnt,
 				.dentry = bm->btrfs_mnt->mnt_root,
@@ -562,11 +576,18 @@ static int bdfs_blend_trigger_copyup(struct inode *inode,
 			char *rp = d_path(&btrfs_root, root_buf,
 					  sizeof(root_buf));
 			if (!IS_ERR(rp)) {
-				/* upper = btrfs_root + basename(lower) */
-				const char *base = strrchr(lower_buf, '/');
-				if (base)
-					snprintf(upper_buf, sizeof(upper_buf),
-						 "%s%s", rp, base);
+				char *relpath_buf = kmalloc(PATH_MAX,
+							    GFP_KERNEL);
+				if (relpath_buf) {
+					char *rel = bdfs_blend_rel_path(
+						bi->real_path.dentry,
+						relpath_buf, PATH_MAX);
+					if (!IS_ERR(rel))
+						snprintf(upper_buf,
+							 sizeof(upper_buf),
+							 "%s/%s", rp, rel);
+					kfree(relpath_buf);
+				}
 			}
 		}
 
@@ -593,40 +614,6 @@ static int bdfs_blend_trigger_copyup(struct inode *inode,
 		return -ETIMEDOUT;
 
 	return 0;
-}
-
-/* ── Write path helpers ──────────────────────────────────────────────────── */
-
-/*
- * bdfs_blend_upper_path - Return the real path on the BTRFS upper layer.
- *
- * For upper-layer inodes this is bi->real_path directly.  For lower-layer
- * inodes this constructs the corresponding upper-layer path by appending
- * the dentry name to the BTRFS upper root.  Used by write operations that
- * need to operate on the upper layer even before copy-up has run.
- */
-static int bdfs_blend_upper_path(struct inode *dir, struct dentry *dentry,
-				 struct bdfs_blend_mount *bm,
-				 struct path *upper_path)
-{
-	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
-
-	if (!bm->btrfs_mnt)
-		return -EIO;
-
-	/*
-	 * If the parent is already on the upper layer, resolve relative to it.
-	 * Otherwise resolve relative to the BTRFS upper root.
-	 */
-	if (parent_bi->is_upper) {
-		return vfs_path_lookup(parent_bi->real_path.dentry,
-				       parent_bi->real_path.mnt,
-				       dentry->d_name.name, 0, upper_path);
-	}
-
-	return vfs_path_lookup(bm->btrfs_mnt->mnt_root,
-			       bm->btrfs_mnt,
-			       dentry->d_name.name, 0, upper_path);
 }
 
 /* ── File operations ─────────────────────────────────────────────────────── */

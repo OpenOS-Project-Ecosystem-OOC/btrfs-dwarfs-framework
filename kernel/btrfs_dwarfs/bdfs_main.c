@@ -301,15 +301,15 @@ static long bdfs_ctl_ioctl(struct file *file, unsigned int cmd,
 
 	case BDFS_IOC_RESOLVE_PATH:
 		return bdfs_resolve_path(uarg, &bdfs_partition_list,
-					 &bdfs_partition_lock);
+					 &bdfs_registry_lock);
 
 	case BDFS_IOC_PROMOTE_TO_BTRFS:
 		return bdfs_btrfs_import(uarg, &bdfs_partition_list,
-					 &bdfs_partition_lock);
+					 &bdfs_registry_lock);
 
 	case BDFS_IOC_DEMOTE_TO_DWARFS:
 		return bdfs_dwarfs_export(uarg, &bdfs_partition_list,
-					  &bdfs_partition_lock);
+					  &bdfs_registry_lock);
 
 	default:
 		return -ENOTTY;
