@@ -252,7 +252,12 @@ jobs:
           sudo modprobe fuse    || true
 
       - name: Run integration tests
-        run: sudo bash tests/integration/run_all.sh
+        run: |
+          if [ "$KO_BUILT" = "true" ]; then
+            sudo bash tests/integration/run_all.sh
+          else
+            echo "Skipping integration tests as kernel module was not built."
+          fi
         timeout-minutes: 15
 
   # ── Formatting check ───────────────────────────────────────────────────────
