@@ -8,7 +8,11 @@
 #include <assert.h>
 
 #define main bdfs_cli_main_unused
-#ifndef BDFS_CMAKE_BUILD
+#ifdef BDFS_CMAKE_BUILD
+/* cmake build: include headers for type and function declarations */
+#  include "btrfs_dwarfs/types.h"
+#  include "../../userspace/cli/bdfs.h"
+#else
 #  include "../../userspace/cli/bdfs_main.c"
 #endif
 #undef main
