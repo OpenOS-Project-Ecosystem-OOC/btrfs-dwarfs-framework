@@ -207,11 +207,15 @@ void bdfs_mount_untrack(struct bdfs_daemon *d, const char *mount_point);
 int  bdfs_mount_count(struct bdfs_daemon *d);
 
 /* netlink event listener (bdfs_netlink.c) */
+#ifndef bdfs_netlink_init
 int  bdfs_netlink_init(struct bdfs_daemon *d);
+#endif
 void bdfs_netlink_loop(struct bdfs_daemon *d);
 
 /* unix socket server for CLI (bdfs_socket.c) */
+#ifndef bdfs_socket_init
 int  bdfs_socket_init(struct bdfs_daemon *d);
+#endif
 void bdfs_socket_loop(struct bdfs_daemon *d);
 
 /* tool execution helpers (bdfs_exec.c) */
