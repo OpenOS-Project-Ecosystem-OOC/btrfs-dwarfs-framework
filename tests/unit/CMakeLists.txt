@@ -14,15 +14,15 @@ include_directories(
 )
 
 # ── test_uuid ────────────────────────────────────────────────────────────────
-add_executable(test_uuid test_uuid.c
-    ../../userspace/cli/bdfs_main.c)
-target_compile_definitions(test_uuid PRIVATE BDFS_UNIT_TEST BDFS_CMAKE_BUILD)
+add_executable(test_uuid test_uuid.c)
+target_compile_definitions(test_uuid PRIVATE BDFS_UNIT_TEST)
+target_link_options(test_uuid PRIVATE -Wl,--unresolved-symbols=ignore-in-object-files)
 add_test(NAME uuid COMMAND test_uuid)
 
 # ── test_compression_names ───────────────────────────────────────────────────
-add_executable(test_compression test_compression.c
-    ../../userspace/cli/bdfs_main.c)
-target_compile_definitions(test_compression PRIVATE BDFS_UNIT_TEST BDFS_CMAKE_BUILD)
+add_executable(test_compression test_compression.c)
+target_compile_definitions(test_compression PRIVATE BDFS_UNIT_TEST)
+target_link_options(test_compression PRIVATE -Wl,--unresolved-symbols=ignore-in-object-files)
 add_test(NAME compression COMMAND test_compression)
 
 # ── test_job_alloc ───────────────────────────────────────────────────────────
