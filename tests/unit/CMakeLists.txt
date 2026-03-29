@@ -26,9 +26,8 @@ target_compile_definitions(test_compression PRIVATE BDFS_UNIT_TEST)
 add_test(NAME compression COMMAND test_compression)
 
 # ── test_job_alloc ───────────────────────────────────────────────────────────
-add_executable(test_job_alloc test_job_alloc.c
-    ../../userspace/daemon/bdfs_daemon.c)
-target_compile_definitions(test_job_alloc PRIVATE BDFS_UNIT_TEST BDFS_CMAKE_BUILD)
+add_executable(test_job_alloc test_job_alloc.c)
+target_compile_definitions(test_job_alloc PRIVATE BDFS_UNIT_TEST)
 target_link_libraries(test_job_alloc PRIVATE pthread)
 add_test(NAME job_alloc COMMAND test_job_alloc)
 
