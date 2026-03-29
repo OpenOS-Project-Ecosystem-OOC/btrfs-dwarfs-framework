@@ -15,11 +15,16 @@
 static int stub_netlink_init_called = 0;
 static int stub_socket_init_called  = 0;
 
-/* Include only the job alloc/free/enqueue logic by redefining main */
+/* Include only the job alloc/free/enqueue logic by redefining main.
+ * When building via cmake (BDFS_CMAKE_BUILD), all source files are compiled
+ * as separate TUs and linked together. For standalone gcc builds, include
+ * bdfs_daemon.c directly so the macro stubs below take effect. */
 #define main bdfs_daemon_main_unused
 #define bdfs_netlink_init(d) (stub_netlink_init_called++, (d)->nl_fd = -1, 0)
 #define bdfs_socket_init(d)  (stub_socket_init_called++,  (d)->sock_fd = -1, 0)
-#include "../../userspace/daemon/bdfs_daemon.c"
+#ifndef BDFS_CMAKE_BUILD
+#  include "../../userspace/daemon/bdfs_daemon.c"
+#endif
 #undef main
 
 static int tests_run = 0, tests_failed = 0;
