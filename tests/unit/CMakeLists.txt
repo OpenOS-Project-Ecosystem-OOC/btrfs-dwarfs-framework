@@ -26,8 +26,25 @@ target_compile_definitions(test_compression PRIVATE BDFS_UNIT_TEST)
 add_test(NAME compression COMMAND test_compression)
 
 # ── test_job_alloc ───────────────────────────────────────────────────────────
-add_executable(test_job_alloc test_job_alloc.c)
-target_compile_definitions(test_job_alloc PRIVATE BDFS_UNIT_TEST)
+# test_job_alloc.c includes bdfs_daemon.c directly for standalone builds.
+# For cmake builds (BDFS_CMAKE_BUILD defined), the include is skipped and all
+# daemon source files are compiled as separate translation units.
+add_executable(test_job_alloc test_job_alloc.c
+    ../../userspace/daemon/bdfs_daemon.c
+    ../../userspace/daemon/bdfs_jobs.c
+    ../../userspace/daemon/bdfs_exec.c
+    ../../userspace/daemon/bdfs_netlink.c
+    ../../userspace/daemon/bdfs_socket.c
+    ../../userspace/daemon/bdfs_policy.c
+    ../../userspace/cli/bdfs_export_import.c
+    ../../userspace/cli/bdfs_mount.c
+    ../../userspace/cli/bdfs_partition.c
+    ../../userspace/cli/bdfs_policy.c
+    ../../userspace/cli/bdfs_snapshot_promote_demote.c
+    ../../userspace/cli/bdfs_status.c
+    ../../userspace/cli/bdfs_verify.c
+    ../../userspace/cli/bdfs_main.c)
+target_compile_definitions(test_job_alloc PRIVATE BDFS_UNIT_TEST BDFS_CMAKE_BUILD)
 target_link_libraries(test_job_alloc PRIVATE pthread)
 add_test(NAME job_alloc COMMAND test_job_alloc)
 
