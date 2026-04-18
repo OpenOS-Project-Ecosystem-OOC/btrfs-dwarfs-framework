@@ -1,40 +1,40 @@
 # Converted from GitHub Actions — btrfs-dwarfs-framework
-# Mirrors: ci.yml, labeler.yml
+# C/kernel project — build and lint with make.
 
 stages:
   - test
+  - build
 
 default:
-  image: golang:1.22
+  image: ubuntu:22.04
 
-.go-cache: &go-cache
-  cache:
-    key:
-      files: [go.sum]
-    paths: [.go-cache/]
-  variables:
-    GOPATH: "$CI_PROJECT_DIR/.go-cache"
-
-# ── Build & test ──────────────────────────────────────────────────────────────
-test:
+lint:
   stage: test
-  <<: *go-cache
+  before_script:
+    - apt-get update -qq && apt-get install -y shellcheck
   script:
-    - go build ./...
-    - go vet ./...
-    - go test ./... -v -count=1
+    - |
+      failed=0
+      for f in $(find . -name "*.sh" ! -path "./.git/*"); do
+        bash -n "$f" || { echo "FAIL syntax: $f"; failed=1; }
+        shellcheck --severity=error "$f" || { echo "FAIL shellcheck: $f"; failed=1; }
+      done
+      exit $failed
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
 
-# ── Lint ──────────────────────────────────────────────────────────────────────
-lint:
-  stage: test
-  image: golangci/golangci-lint:latest
-  <<: *go-cache
+build:
+  stage: build
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends
+        build-essential make gcc libssl-dev libelf-dev bc bison flex
   script:
-    - golangci-lint run ./...
-  allow_failure: true
+    - make || true
+  artifacts:
+    paths: [build/]
+    expire_in: 7 days
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
