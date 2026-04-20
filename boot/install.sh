@@ -1,130 +1,190 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# boot/install.sh - Install BDFS boot integration components
+# boot/install.sh - Install BDFS boot integration and maintenance components
 #
 # Usage:
-#   sudo bash boot/install.sh [--initramfs-tools | --dracut] [--dry-run]
+#   sudo bash boot/install.sh [OPTIONS]
 #
-# Detects the initramfs system automatically if not specified.
+# Options:
+#   --initramfs-tools   Force initramfs-tools backend
+#   --dracut            Force dracut backend
+#   --maintenance       Install scrub/balance systemd units only
+#   --homed-check       Install homed-identity-check tool and units
+#   --dry-run           Print actions without executing them
+#   --help              Show this help
 
 set -euo pipefail
 
 DRY_RUN=0
 INITRAMFS_SYSTEM=""
+DO_BOOT=1
+DO_MAINTENANCE=0
+DO_HOMED=0
 
 for arg in "$@"; do
-    case "$arg" in
-        --initramfs-tools) INITRAMFS_SYSTEM="initramfs-tools" ;;
-        --dracut)          INITRAMFS_SYSTEM="dracut" ;;
-        --dry-run)         DRY_RUN=1 ;;
-    esac
+	case "$arg" in
+	--initramfs-tools) INITRAMFS_SYSTEM="initramfs-tools" ;;
+	--dracut)          INITRAMFS_SYSTEM="dracut" ;;
+	--maintenance)     DO_BOOT=0; DO_MAINTENANCE=1 ;;
+	--homed-check)     DO_HOMED=1 ;;
+	--dry-run)         DRY_RUN=1 ;;
+	--help)
+		sed -n '3,/^$/p' "$0" | sed 's/^# \?//'
+		exit 0
+		;;
+	esac
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 run() {
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "[dry-run] $*"
-    else
-        "$@"
-    fi
+	if [[ "$DRY_RUN" -eq 1 ]]; then
+		echo "[dry-run] $*"
+	else
+		"$@"
+	fi
 }
 
-# ── Auto-detect initramfs system ──────────────────────────────────────────
+# ── Maintenance units (scrub + balance) ──────────────────────────────────────
 
-if [[ -z "$INITRAMFS_SYSTEM" ]]; then
-    if command -v update-initramfs &>/dev/null; then
-        INITRAMFS_SYSTEM="initramfs-tools"
-    elif command -v dracut &>/dev/null; then
-        INITRAMFS_SYSTEM="dracut"
-    else
-        echo "error: cannot detect initramfs system (install initramfs-tools or dracut)"
-        exit 1
-    fi
-fi
+install_maintenance() {
+	echo "Installing BDFS maintenance units (scrub + balance)..."
 
-echo "Installing BDFS boot integration (system: $INITRAMFS_SYSTEM)"
+	run install -d /usr/lib/bdfs
+	run install -m755 "$REPO_ROOT/configs/bdfs-scrub.sh"   /usr/lib/bdfs/bdfs-scrub.sh
+	run install -m755 "$REPO_ROOT/configs/bdfs-balance.sh" /usr/lib/bdfs/bdfs-balance.sh
 
-# ── Install image-update script ───────────────────────────────────────────
+	run install -m644 "$REPO_ROOT/configs/bdfs-scrub.service"   /etc/systemd/system/bdfs-scrub.service
+	run install -m644 "$REPO_ROOT/configs/bdfs-scrub.timer"     /etc/systemd/system/bdfs-scrub.timer
+	run install -m644 "$REPO_ROOT/configs/bdfs-balance.service" /etc/systemd/system/bdfs-balance.service
+	run install -m644 "$REPO_ROOT/configs/bdfs-balance.timer"   /etc/systemd/system/bdfs-balance.timer
 
-run install -m755 "$SCRIPT_DIR/bdfs-image-update" /usr/local/sbin/bdfs-image-update
+	# Install genfstab script to libexec
+	run install -m755 "$REPO_ROOT/tools/setup/bdfs-genfstab.sh" /usr/lib/bdfs/bdfs-genfstab.sh
 
-# ── Install systemd units ─────────────────────────────────────────────────
+	if [[ "$DRY_RUN" -eq 0 ]]; then
+		systemctl daemon-reload
+		systemctl enable --now bdfs-scrub.timer
+		systemctl enable --now bdfs-balance.timer
+		echo "Enabled bdfs-scrub.timer and bdfs-balance.timer"
+	fi
+}
 
-run install -m644 \
-    "$SCRIPT_DIR/systemd-generator/bdfs-image-update.service" \
-    /etc/systemd/system/bdfs-image-update.service
+# ── homed-identity-check ─────────────────────────────────────────────────────
 
-run install -m644 \
-    "$SCRIPT_DIR/systemd-generator/bdfs-image-update.timer" \
-    /etc/systemd/system/bdfs-image-update.timer
+install_homed() {
+	echo "Installing homed-identity-check..."
 
-# ── Install boot configuration ────────────────────────────────────────────
+	run install -d /usr/lib/bdfs
+	run install -m755 \
+		"$REPO_ROOT/tools/homed/homed-identity-check.sh" \
+		/usr/lib/bdfs/homed-identity-check.sh
 
-run mkdir -p /etc/bdfs
-if [[ ! -f /etc/bdfs/boot.conf ]]; then
-    run install -m644 \
-        "$SCRIPT_DIR/../configs/boot.conf" \
-        /etc/bdfs/boot.conf
-    echo "Installed /etc/bdfs/boot.conf — edit before rebooting"
-else
-    echo "Skipping /etc/bdfs/boot.conf (already exists)"
-fi
+	run install -m644 \
+		"$REPO_ROOT/tools/homed/homed-identity-check.service" \
+		/etc/systemd/system/homed-identity-check.service
+	run install -m644 \
+		"$REPO_ROOT/tools/homed/homed-identity-check.timer" \
+		/etc/systemd/system/homed-identity-check.timer
+	run install -m644 \
+		"$REPO_ROOT/tools/homed/homed-identity-check.path" \
+		/etc/systemd/system/homed-identity-check.path
 
-# ── Install initramfs hook ────────────────────────────────────────────────
+	if [[ "$DRY_RUN" -eq 0 ]]; then
+		# Only activate if systemd-homed is present on this system
+		if systemctl is-active --quiet systemd-homed 2>/dev/null || \
+		   systemctl is-enabled --quiet systemd-homed 2>/dev/null; then
+			systemctl daemon-reload
+			systemctl enable --now homed-identity-check.path
+			echo "Enabled homed-identity-check.path"
+		else
+			echo "systemd-homed not active — homed-identity-check units installed but not enabled."
+			echo "Enable manually with: systemctl enable --now homed-identity-check.path"
+		fi
+	fi
+}
 
-if [[ "$INITRAMFS_SYSTEM" == "initramfs-tools" ]]; then
-    run install -m755 \
-        "$SCRIPT_DIR/initramfs/hooks/bdfs" \
-        /etc/initramfs-tools/hooks/bdfs
-    run install -m755 \
-        "$SCRIPT_DIR/initramfs/scripts/bdfs-root" \
-        /etc/initramfs-tools/scripts/local-premount/bdfs-root
-    echo "Installed initramfs-tools hook and script"
+# ── Boot integration ─────────────────────────────────────────────────────────
 
-elif [[ "$INITRAMFS_SYSTEM" == "dracut" ]]; then
-    run mkdir -p /usr/lib/dracut/modules.d/90bdfs
-    run install -m755 \
-        "$SCRIPT_DIR/dracut/module-setup.sh" \
-        /usr/lib/dracut/modules.d/90bdfs/module-setup.sh
-    run install -m755 \
-        "$SCRIPT_DIR/dracut/bdfs-root.sh" \
-        /usr/lib/dracut/modules.d/90bdfs/bdfs-root.sh
-    echo "Installed dracut module 90bdfs"
-fi
+install_boot() {
+	# Auto-detect initramfs system if not specified
+	if [[ -z "$INITRAMFS_SYSTEM" ]]; then
+		if command -v update-initramfs &>/dev/null; then
+			INITRAMFS_SYSTEM="initramfs-tools"
+		elif command -v dracut &>/dev/null; then
+			INITRAMFS_SYSTEM="dracut"
+		else
+			echo "error: cannot detect initramfs system (install initramfs-tools or dracut)"
+			exit 1
+		fi
+	fi
 
-# ── Rebuild initramfs ─────────────────────────────────────────────────────
+	echo "Installing BDFS boot integration (initramfs: $INITRAMFS_SYSTEM)..."
 
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    echo ""
-    echo "Rebuilding initramfs..."
-    if [[ "$INITRAMFS_SYSTEM" == "initramfs-tools" ]]; then
-        update-initramfs -u -k all
-    else
-        dracut --force --add bdfs
-    fi
-    echo "Initramfs rebuilt."
-fi
+	run install -d /usr/lib/bdfs
+	run install -m755 "$SCRIPT_DIR/bdfs-image-update" /usr/local/sbin/bdfs-image-update
 
-# ── Enable systemd timer ──────────────────────────────────────────────────
+	run install -m644 \
+		"$SCRIPT_DIR/systemd-generator/bdfs-image-update.service" \
+		/etc/systemd/system/bdfs-image-update.service
+	run install -m644 \
+		"$SCRIPT_DIR/systemd-generator/bdfs-image-update.timer" \
+		/etc/systemd/system/bdfs-image-update.timer
 
-if [[ "$DRY_RUN" -eq 0 ]]; then
-    systemctl daemon-reload
-    systemctl enable bdfs-image-update.timer
-    echo "Enabled bdfs-image-update.timer"
-fi
+	run install -d /etc/bdfs
+	if [[ ! -f /etc/bdfs/boot.conf ]]; then
+		run install -m644 "$REPO_ROOT/configs/boot.conf" /etc/bdfs/boot.conf
+		echo "Installed /etc/bdfs/boot.conf — edit before rebooting"
+	else
+		echo "Skipping /etc/bdfs/boot.conf (already exists)"
+	fi
+
+	if [[ "$INITRAMFS_SYSTEM" == "initramfs-tools" ]]; then
+		run install -m755 \
+			"$SCRIPT_DIR/initramfs/hooks/bdfs" \
+			/etc/initramfs-tools/hooks/bdfs
+		run install -m755 \
+			"$SCRIPT_DIR/initramfs/scripts/bdfs-root" \
+			/etc/initramfs-tools/scripts/local-premount/bdfs-root
+		echo "Installed initramfs-tools hook and script"
+	elif [[ "$INITRAMFS_SYSTEM" == "dracut" ]]; then
+		run install -d /usr/lib/dracut/modules.d/90bdfs
+		run install -m755 \
+			"$SCRIPT_DIR/dracut/module-setup.sh" \
+			/usr/lib/dracut/modules.d/90bdfs/module-setup.sh
+		run install -m755 \
+			"$SCRIPT_DIR/dracut/bdfs-root.sh" \
+			/usr/lib/dracut/modules.d/90bdfs/bdfs-root.sh
+		echo "Installed dracut module 90bdfs"
+	fi
+
+	if [[ "$DRY_RUN" -eq 0 ]]; then
+		echo "Rebuilding initramfs..."
+		if [[ "$INITRAMFS_SYSTEM" == "initramfs-tools" ]]; then
+			update-initramfs -u -k all
+		else
+			dracut --force --add bdfs
+		fi
+		systemctl daemon-reload
+		systemctl enable bdfs-image-update.timer
+		echo "Enabled bdfs-image-update.timer"
+	fi
+
+	echo ""
+	echo "Next steps:"
+	echo "  1. Edit /etc/bdfs/boot.conf"
+	echo "  2. Add to kernel cmdline:"
+	echo "       bdfs.root=/dev/sdXN bdfs.image=/images/system.dwarfs bdfs.upper=/dev/sdYN"
+	echo "  3. Reboot"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+[[ "$DO_MAINTENANCE" -eq 1 ]] && install_maintenance
+[[ "$DO_HOMED"       -eq 1 ]] && install_homed
+[[ "$DO_BOOT"        -eq 1 ]] && { install_maintenance; install_boot; }
 
 echo ""
 echo "Installation complete."
-echo ""
-echo "Next steps:"
-echo "  1. Edit /etc/bdfs/boot.conf"
-echo "  2. Add to GRUB_CMDLINE_LINUX in /etc/default/grub:"
-echo "       bdfs.root=/dev/sdXN bdfs.image=/images/system.dwarfs"
-echo "       bdfs.upper=/dev/sdYN"
-echo "  3. Run: sudo update-grub"
-echo "  4. Reboot"
-echo ""
-echo "To roll back after a bad update, add 'bdfs.rollback' to the kernel"
-echo "cmdline at boot (e.g. via GRUB edit mode)."

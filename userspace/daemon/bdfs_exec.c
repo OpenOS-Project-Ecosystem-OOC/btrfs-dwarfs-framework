@@ -2,22 +2,21 @@
 /*
  * bdfs_exec.c - Tool execution helpers
  *
- * Wrappers around mkdwarfs, dwarfs, dwarfsextract, and btrfs-progs.
- * Each function forks a child process, sets up pipes where needed,
- * and waits for completion.  Stdout/stderr are forwarded to syslog
+ * Wrappers around mkdwarfs, dwarfs, dwarfsextract, fuse-overlayfs, and
+ * btrfs-progs.  Each function forks a child process, sets up pipes where
+ * needed, and waits for completion.  Stdout/stderr are forwarded to syslog
  * when verbose mode is enabled.
  */
-
+#include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <syslog.h>
+#include <sys/sendfile.h>
 #include <sys/wait.h>
-#include <sys/types.h>
+#include <syslog.h>
+#include <unistd.h>
 
 #include "bdfs_daemon.h"
 
@@ -40,7 +39,7 @@ static const char *compression_name(uint32_t c)
 int bdfs_exec_wait(const char *const argv[])
 {
 	pid_t pid;
-	int status;
+	int   status;
 
 	pid = fork();
 	if (pid < 0)
@@ -60,10 +59,8 @@ int bdfs_exec_wait(const char *const argv[])
 
 	if (waitpid(pid, &status, 0) < 0)
 		return -errno;
-
 	if (WIFEXITED(status))
 		return WEXITSTATUS(status) == 0 ? 0 : -EIO;
-
 	return -EIO;
 }
 
@@ -79,34 +76,35 @@ int bdfs_exec_wait(const char *const argv[])
  *            --num-workers <n>
  *            --categorize
  */
-int bdfs_exec_mkdwarfs(struct bdfs_daemon *d,
-		       const char *input_dir,
-		       const char *output_image,
-		       uint32_t compression,
-		       uint32_t block_size_bits,
-		       int worker_threads)
+int bdfs_exec_mkdwarfs(struct bdfs_daemon *d, const char *input_dir,
+		       const char *output_image, uint32_t compression,
+		       uint32_t block_size_bits, int worker_threads)
 {
 	char bits_str[16], workers_str[16];
 	const char *argv[32];
 	int i = 0;
 
-	snprintf(bits_str, sizeof(bits_str), "%u",
+	snprintf(bits_str,    sizeof(bits_str),    "%u",
 		 block_size_bits ? block_size_bits : 22);
 	snprintf(workers_str, sizeof(workers_str), "%d",
-		 worker_threads ? worker_threads : 4);
+		 worker_threads  ? worker_threads  : 4);
 
 	argv[i++] = d->cfg.mkdwarfs_bin;
-	argv[i++] = "-i"; argv[i++] = input_dir;
-	argv[i++] = "-o"; argv[i++] = output_image;
-	argv[i++] = "--compression"; argv[i++] = compression_name(compression);
-	argv[i++] = "--block-size-bits"; argv[i++] = bits_str;
-	argv[i++] = "--num-workers"; argv[i++] = workers_str;
+	argv[i++] = "-i";
+	argv[i++] = input_dir;
+	argv[i++] = "-o";
+	argv[i++] = output_image;
+	argv[i++] = "--compression";
+	argv[i++] = compression_name(compression);
+	argv[i++] = "--block-size-bits";
+	argv[i++] = bits_str;
+	argv[i++] = "--num-workers";
+	argv[i++] = workers_str;
 	argv[i++] = "--categorize";
 	argv[i++] = NULL;
 
 	syslog(LOG_INFO, "bdfs: mkdwarfs %s → %s (compression=%s)",
 	       input_dir, output_image, compression_name(compression));
-
 	return bdfs_exec_wait(argv);
 }
 
@@ -118,8 +116,7 @@ int bdfs_exec_mkdwarfs(struct bdfs_daemon *d,
  * Equivalent to:
  *   dwarfsextract -i <image_path> -o <output_dir>
  */
-int bdfs_exec_dwarfsextract(struct bdfs_daemon *d,
-			    const char *image_path,
+int bdfs_exec_dwarfsextract(struct bdfs_daemon *d, const char *image_path,
 			    const char *output_dir)
 {
 	const char *argv[] = {
@@ -128,7 +125,6 @@ int bdfs_exec_dwarfsextract(struct bdfs_daemon *d,
 		"-o", output_dir,
 		NULL
 	};
-
 	syslog(LOG_INFO, "bdfs: dwarfsextract %s → %s", image_path, output_dir);
 	return bdfs_exec_wait(argv);
 }
@@ -139,14 +135,12 @@ int bdfs_exec_dwarfsextract(struct bdfs_daemon *d,
  * bdfs_exec_dwarfs_mount - FUSE-mount a DwarFS image.
  *
  * Equivalent to:
- *   dwarfs <image_path> <mount_point> -o cache_size=<N>m
+ *   dwarfs <image_path> <mount_point> -o cache_size=<n>m
  *
  * The dwarfs FUSE driver runs in the background by default.
  */
-int bdfs_exec_dwarfs_mount(struct bdfs_daemon *d,
-			   const char *image_path,
-			   const char *mount_point,
-			   uint32_t cache_mb)
+int bdfs_exec_dwarfs_mount(struct bdfs_daemon *d, const char *image_path,
+			   const char *mount_point, uint32_t cache_mb)
 {
 	char cache_opt[64];
 	const char *argv[16];
@@ -158,26 +152,66 @@ int bdfs_exec_dwarfs_mount(struct bdfs_daemon *d,
 	argv[i++] = d->cfg.dwarfs_bin;
 	argv[i++] = image_path;
 	argv[i++] = mount_point;
-	argv[i++] = "-o"; argv[i++] = cache_opt;
+	argv[i++] = "-o";
+	argv[i++] = cache_opt;
 	argv[i++] = NULL;
 
 	syslog(LOG_INFO, "bdfs: dwarfs mount %s → %s (cache=%um)",
 	       image_path, mount_point, cache_mb);
-
 	return bdfs_exec_wait(argv);
 }
 
 /* ── dwarfs FUSE unmount ────────────────────────────────────────────────── */
 
-int bdfs_exec_dwarfs_umount(struct bdfs_daemon *d,
-			    const char *mount_point)
+int bdfs_exec_dwarfs_umount(struct bdfs_daemon *d, const char *mount_point)
 {
-	const char *argv[] = {
-		"fusermount", "-u", mount_point, NULL
-	};
+	const char *argv[] = { "fusermount", "-u", mount_point, NULL };
 	(void)d;
-
 	syslog(LOG_INFO, "bdfs: fusermount -u %s", mount_point);
+	return bdfs_exec_wait(argv);
+}
+
+/* ── fuse-overlayfs ─────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_exec_fuse_overlayfs - Mount a fuse-overlayfs overlay.
+ *
+ * Equivalent to:
+ *   fuse-overlayfs \
+ *     -o lowerdir=<lower>,upperdir=<upper>,workdir=<work> \
+ *     <merged>
+ *
+ * fuse-overlayfs runs in the foreground by default; we pass -f so it
+ * daemonises itself after the mount succeeds (same behaviour as the dwarfs
+ * FUSE driver).  If the binary is not in cfg.fuse_overlayfs_bin we fall
+ * back to searching PATH for "fuse-overlayfs".
+ */
+int bdfs_exec_fuse_overlayfs(struct bdfs_daemon *d, const char *lower,
+			     const char *upper, const char *work,
+			     const char *merged)
+{
+	char opt[BDFS_PATH_MAX * 3 + 64];
+	const char *bin;
+	const char *argv[16];
+	int i = 0;
+
+	bin = (d->cfg.fuse_overlayfs_bin[0])
+		? d->cfg.fuse_overlayfs_bin
+		: "fuse-overlayfs";
+
+	snprintf(opt, sizeof(opt),
+		 "lowerdir=%s,upperdir=%s,workdir=%s",
+		 lower, upper, work);
+
+	argv[i++] = bin;
+	argv[i++] = "-o";
+	argv[i++] = opt;
+	argv[i++] = merged;
+	argv[i++] = NULL;
+
+	syslog(LOG_INFO,
+	       "bdfs: fuse-overlayfs lower=%s upper=%s work=%s → %s",
+	       lower, upper, work, merged);
 	return bdfs_exec_wait(argv);
 }
 
@@ -192,10 +226,9 @@ int bdfs_exec_dwarfs_umount(struct bdfs_daemon *d,
  * the returned pid (stored in *child_pid_out).
  *
  * Equivalent to:
- *   btrfs send <subvol_path>   (stdout → pipe)
+ *   btrfs send <subvol_path>  (stdout → pipe)
  */
-int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
-			 const char *subvol_path,
+int bdfs_exec_btrfs_send(struct bdfs_daemon *d, const char *subvol_path,
 			 int *pipe_read_fd_out)
 {
 	return bdfs_exec_btrfs_send_incremental(d, subvol_path, NULL,
@@ -203,8 +236,8 @@ int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
 }
 
 /*
- * bdfs_exec_btrfs_send_incremental - Start a `btrfs send` process, optionally
- * with a parent snapshot for incremental sends.
+ * bdfs_exec_btrfs_send_incremental - Start a `btrfs send` process,
+ * optionally with a parent snapshot for incremental sends.
  *
  * When parent_snap_path is non-NULL and non-empty, passes `-p <parent>` to
  * btrfs-send, producing a delta stream relative to the parent snapshot.
@@ -212,15 +245,15 @@ int bdfs_exec_btrfs_send(struct bdfs_daemon *d,
  * resulting DwarFS image) when only a small portion of the subvolume changed.
  *
  * Equivalent to:
- *   btrfs send [-p <parent_snap>] <subvol_path>   (stdout → pipe)
+ *   btrfs send [-p <parent>] <subvol_path>  (stdout → pipe)
  */
 int bdfs_exec_btrfs_send_incremental(struct bdfs_daemon *d,
 				     const char *subvol_path,
 				     const char *parent_snap_path,
 				     int *pipe_read_fd_out)
 {
-	int pipefd[2];
-	pid_t pid;
+	int    pipefd[2];
+	pid_t  pid;
 
 	if (pipe2(pipefd, O_CLOEXEC) < 0)
 		return -errno;
@@ -239,8 +272,7 @@ int bdfs_exec_btrfs_send_incremental(struct bdfs_daemon *d,
 
 		if (parent_snap_path && parent_snap_path[0]) {
 			execlp(d->cfg.btrfs_bin, "btrfs", "send",
-			       "-p", parent_snap_path,
-			       subvol_path, NULL);
+			       "-p", parent_snap_path, subvol_path, NULL);
 		} else {
 			execlp(d->cfg.btrfs_bin, "btrfs", "send",
 			       subvol_path, NULL);
@@ -268,14 +300,13 @@ int bdfs_exec_btrfs_send_incremental(struct bdfs_daemon *d,
  * a pipe.
  *
  * Equivalent to:
- *   btrfs receive <dest_dir>   (stdin ← pipe)
+ *   btrfs receive <dest_dir>  (stdin ← pipe)
  */
-int bdfs_exec_btrfs_receive(struct bdfs_daemon *d,
-			    const char *dest_dir,
+int bdfs_exec_btrfs_receive(struct bdfs_daemon *d, const char *dest_dir,
 			    int pipe_read_fd)
 {
 	pid_t pid;
-	int status;
+	int   status;
 
 	pid = fork();
 	if (pid < 0)
@@ -292,16 +323,13 @@ int bdfs_exec_btrfs_receive(struct bdfs_daemon *d,
 
 	syslog(LOG_INFO, "bdfs: btrfs receive %s (exit=%d)",
 	       dest_dir, WEXITSTATUS(status));
-
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -EIO;
 }
 
 /* ── btrfs subvolume snapshot ───────────────────────────────────────────── */
 
-int bdfs_exec_btrfs_snapshot(struct bdfs_daemon *d,
-			     const char *source_subvol,
-			     const char *dest_path,
-			     bool readonly)
+int bdfs_exec_btrfs_snapshot(struct bdfs_daemon *d, const char *source_subvol,
+			     const char *dest_path, bool readonly)
 {
 	const char *argv[8];
 	int i = 0;
@@ -327,7 +355,6 @@ int bdfs_exec_btrfs_subvol_create(struct bdfs_daemon *d, const char *path)
 	const char *argv[] = {
 		d->cfg.btrfs_bin, "subvolume", "create", path, NULL
 	};
-
 	syslog(LOG_INFO, "bdfs: btrfs subvolume create %s", path);
 	return bdfs_exec_wait(argv);
 }
@@ -339,7 +366,6 @@ int bdfs_exec_btrfs_subvol_delete(struct bdfs_daemon *d, const char *path)
 	const char *argv[] = {
 		d->cfg.btrfs_bin, "subvolume", "delete", path, NULL
 	};
-
 	syslog(LOG_INFO, "bdfs: btrfs subvolume delete %s", path);
 	return bdfs_exec_wait(argv);
 }

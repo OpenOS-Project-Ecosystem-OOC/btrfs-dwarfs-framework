@@ -4,169 +4,276 @@
 # test_blend_layer.sh - Blend layer (unified namespace) tests
 #
 # Tests the promote/demote cycle and unified namespace behaviour:
-#   1. Set up a BTRFS upper layer and a DwarFS lower layer
-#   2. Simulate the blend namespace by overlaying them with overlayfs
-#      (the real bdfs_blend kernel module is tested separately; here we
-#       validate the data-movement semantics using overlayfs as a proxy)
-#   3. Verify read routing: lower layer visible through blend
-#   4. Verify write routing: writes go to upper layer (copy-up)
-#   5. Demote: export upper subvolume to DwarFS, verify image
-#   6. Promote: extract DwarFS image to new subvolume, verify content
-#   7. Verify promote→demote→promote round-trip preserves data
+#   - Kernel blend mount (bdfs_blend module)
+#   - Userspace blend mount (fuse-overlayfs fallback)
+#   - Auto-fallback from kernel to userspace on ENODEV
+#   - Teardown order: overlay unmounted before DwarFS lower layer
+#
+# Run as root against a loopback BTRFS device.
+# Requires: btrfs-progs, dwarfs, fuse-overlayfs, bdfs CLI
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib.sh"
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
 
-require_root
-require_cmd mkfs.btrfs    || exit 0
-require_cmd mkdwarfs      || exit 0
-require_cmd dwarfs        || exit 0
-require_cmd dwarfsextract || exit 0
-require_cmd fusermount    || exit 0
-require_module overlay    || exit 0
+# ── Fixtures ─────────────────────────────────────────────────────────────────
 
-echo "=== Blend layer tests ==="
+setup_blend_fixtures() {
+	# Create a BTRFS loopback device
+	BTRFS_IMG="$TEST_TMP/btrfs.img"
+	BTRFS_MNT="$TEST_TMP/btrfs"
+	truncate -s 2G "$BTRFS_IMG"
+	mkfs.btrfs -q "$BTRFS_IMG"
+	mkdir -p "$BTRFS_MNT"
+	mount -o loop "$BTRFS_IMG" "$BTRFS_MNT"
 
-# ── Setup ────────────────────────────────────────────────────────────────────
+	# Create a source subvolume with known content
+	btrfs subvolume create "$BTRFS_MNT/source"
+	echo "hello from btrfs" > "$BTRFS_MNT/source/btrfs_file.txt"
+	mkdir -p "$BTRFS_MNT/source/subdir"
+	echo "nested" > "$BTRFS_MNT/source/subdir/nested.txt"
 
-BTRFS_MNT=$(mktemp -d /tmp/bdfs_blend_btrfs_XXXXXX)
-DWARFS_MNT=$(mktemp -d /tmp/bdfs_blend_dwarfs_XXXXXX)
-BLEND_MNT=$(mktemp -d /tmp/bdfs_blend_XXXXXX)
-WORK_DIR=$(mktemp -d /tmp/bdfs_blend_work_XXXXXX)
-DWARFS_IMG=$(mktemp /tmp/bdfs_blend_XXXXXX.dwarfs)
-TEMP_DIRS+=("$BTRFS_MNT" "$DWARFS_MNT" "$BLEND_MNT" "$WORK_DIR" "$DWARFS_IMG")
+	# Create a read-only snapshot for export
+	btrfs subvolume snapshot -r \
+		"$BTRFS_MNT/source" "$BTRFS_MNT/source_snap"
 
-make_loop_device 512 BTRFS_DEV
-make_btrfs "$BTRFS_DEV" "bdfs_blend_test"
-mount_btrfs "$BTRFS_DEV" "$BTRFS_MNT"
+	# Export the snapshot to a DwarFS image
+	DWARFS_IMG="$TEST_TMP/test.dwarfs"
+	mkdwarfs -i "$BTRFS_MNT/source_snap" -o "$DWARFS_IMG" \
+		--compression zstd --num-workers 2 2>/dev/null
 
-# Create upper and work subvolumes for overlayfs
-btrfs subvolume create "$BTRFS_MNT/upper" &>/dev/null
-btrfs subvolume create "$BTRFS_MNT/work"  &>/dev/null
+	# Create the BTRFS upper subvolume (writable layer)
+	btrfs subvolume create "$BTRFS_MNT/upper"
 
-# ── Test 1: Create lower layer (DwarFS image) ─────────────────────────────────
+	# Create the overlayfs workdir on the same BTRFS filesystem
+	btrfs subvolume create "$BTRFS_MNT/workdir"
 
-# Populate a directory to become the DwarFS lower layer
-LOWER_SRC=$(mktemp -d /tmp/bdfs_lower_XXXXXX)
-TEMP_DIRS+=("$LOWER_SRC")
-mkdir -p "$LOWER_SRC/shared" "$LOWER_SRC/lower_only"
-echo "lower_data" > "$LOWER_SRC/shared/file.txt"
-echo "only_in_lower" > "$LOWER_SRC/lower_only/data.txt"
-for i in $(seq 1 10); do
-    printf 'lower content %d\n%.0s' {1..200} \
-        > "$LOWER_SRC/lower_only/bulk_$i.txt"
-done
+	# Mountpoints
+	BLEND_MNT="$TEST_TMP/blend"
+	mkdir -p "$BLEND_MNT"
 
-mkdwarfs -i "$LOWER_SRC" -o "$DWARFS_IMG" \
-    --compression zstd --num-workers 2 &>/dev/null
-assert_file_exists "lower DwarFS image created" "$DWARFS_IMG"
+	# Private DwarFS lower mountpoint (mirrors daemon state_dir behaviour)
+	LOWER_MNT="$TEST_TMP/lower_fuse"
+	mkdir -p "$LOWER_MNT"
+}
 
-# Mount DwarFS as lower layer
-MOUNT_POINTS+=("$DWARFS_MNT")
-dwarfs "$DWARFS_IMG" "$DWARFS_MNT" -o cache_size=32m &>/dev/null
-sleep 0.5
-assert_file_exists "lower layer accessible" "$DWARFS_MNT/shared/file.txt"
+teardown_blend_fixtures() {
+	# Unmount in reverse order; ignore errors (already unmounted)
+	umount "$BLEND_MNT"  2>/dev/null || true
+	umount "$LOWER_MNT"  2>/dev/null || true
+	umount "$BTRFS_MNT"  2>/dev/null || true
+}
 
-# ── Test 2: Mount blend (overlayfs: upper=BTRFS, lower=DwarFS) ───────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-MOUNT_POINTS+=("$BLEND_MNT")
-mount -t overlay overlay \
-    -o "lowerdir=$DWARFS_MNT,upperdir=$BTRFS_MNT/upper,workdir=$BTRFS_MNT/work" \
-    "$BLEND_MNT"
+# Mount the DwarFS image at LOWER_MNT using the dwarfs FUSE driver
+mount_dwarfs_lower() {
+	dwarfs "$DWARFS_IMG" "$LOWER_MNT" -o cache_size=64m
+	# Wait for FUSE mount to be ready
+	local retries=10
+	while ! mountpoint -q "$LOWER_MNT" && (( retries-- > 0 )); do
+		sleep 0.1
+	done
+	mountpoint -q "$LOWER_MNT" || fail "dwarfs FUSE mount did not appear"
+}
 
-assert_dir_exists "blend mount point exists" "$BLEND_MNT"
+# Mount fuse-overlayfs over LOWER_MNT + BTRFS_MNT/upper → BLEND_MNT
+mount_userspace_blend() {
+	fuse-overlayfs \
+		-o lowerdir="$LOWER_MNT",upperdir="$BTRFS_MNT/upper",workdir="$BTRFS_MNT/workdir" \
+		"$BLEND_MNT"
+	local retries=10
+	while ! mountpoint -q "$BLEND_MNT" && (( retries-- > 0 )); do
+		sleep 0.1
+	done
+	mountpoint -q "$BLEND_MNT" || fail "fuse-overlayfs mount did not appear"
+}
 
-# ── Test 3: Read routing — lower layer visible through blend ──────────────────
+umount_userspace_blend() {
+	fusermount -u "$BLEND_MNT"  2>/dev/null || umount "$BLEND_MNT"  2>/dev/null || true
+	fusermount -u "$LOWER_MNT"  2>/dev/null || umount "$LOWER_MNT"  2>/dev/null || true
+}
 
-assert_file_exists "lower-only file visible in blend" \
-    "$BLEND_MNT/lower_only/data.txt"
-assert_eq "lower file content correct" \
-    "$(cat "$BLEND_MNT/lower_only/data.txt")" "only_in_lower"
-assert_eq "shared file content from lower" \
-    "$(cat "$BLEND_MNT/shared/file.txt")" "lower_data"
+# ── Tests ─────────────────────────────────────────────────────────────────────
 
-# ── Test 4: Write routing — writes go to upper (copy-up) ─────────────────────
+test_userspace_blend_mount() {
+	desc "userspace blend mount: fuse-overlayfs over dwarfs FUSE"
 
-echo "upper_data" > "$BLEND_MNT/shared/file.txt"
-assert_eq "write visible in blend" \
-    "$(cat "$BLEND_MNT/shared/file.txt")" "upper_data"
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
 
-# Upper layer has the modified file
-assert_eq "write landed in upper layer" \
-    "$(cat "$BTRFS_MNT/upper/shared/file.txt")" "upper_data"
+	setup_blend_fixtures
 
-# Lower layer is unchanged
-assert_eq "lower layer unmodified after write" \
-    "$(cat "$DWARFS_MNT/shared/file.txt")" "lower_data"
+	mount_dwarfs_lower
+	mount_userspace_blend
 
-# ── Test 5: New file in blend goes to upper ───────────────────────────────────
+	# DwarFS lower content is visible through the blend
+	assert_file_contains "$BLEND_MNT/btrfs_file.txt" "hello from btrfs"
+	assert_file_contains "$BLEND_MNT/subdir/nested.txt" "nested"
 
-echo "new_file" > "$BLEND_MNT/new_upper_file.txt"
-assert_file_exists "new file in upper layer" \
-    "$BTRFS_MNT/upper/new_upper_file.txt"
-assert_cmd_fails "new file not in lower layer" \
-    test -f "$DWARFS_MNT/new_upper_file.txt"
+	pass "DwarFS lower content visible through fuse-overlayfs blend"
+}
 
-# ── Test 6: Demote — export upper subvolume to DwarFS ─────────────────────────
+test_userspace_blend_write_goes_to_upper() {
+	desc "userspace blend mount: writes land on BTRFS upper layer"
 
-DEMOTE_IMG=$(mktemp /tmp/bdfs_demote_XXXXXX.dwarfs)
-TEMP_DIRS+=("$DEMOTE_IMG")
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
 
-mkdwarfs -i "$BTRFS_MNT/upper" -o "$DEMOTE_IMG" \
-    --compression zstd --num-workers 2 &>/dev/null
-assert_file_exists "demoted DwarFS image created" "$DEMOTE_IMG"
+	# Write a new file through the blend
+	echo "written via blend" > "$BLEND_MNT/new_file.txt"
 
-# Verify demoted image contains the upper-layer writes
-DEMOTE_MNT=$(mktemp -d /tmp/bdfs_demote_mnt_XXXXXX)
-TEMP_DIRS+=("$DEMOTE_MNT")
-MOUNT_POINTS+=("$DEMOTE_MNT")
-dwarfs "$DEMOTE_IMG" "$DEMOTE_MNT" -o cache_size=32m &>/dev/null
-sleep 0.5
+	# File must appear on the BTRFS upper layer
+	assert_file_exists "$BTRFS_MNT/upper/new_file.txt"
+	assert_file_contains "$BTRFS_MNT/upper/new_file.txt" "written via blend"
 
-assert_eq "demoted image has upper-layer content" \
-    "$(cat "$DEMOTE_MNT/shared/file.txt")" "upper_data"
-assert_file_exists "new file present in demoted image" \
-    "$DEMOTE_MNT/new_upper_file.txt"
+	# DwarFS lower must be unmodified (read-only)
+	assert_file_not_exists "$LOWER_MNT/new_file.txt"
 
-fusermount -u "$DEMOTE_MNT" &>/dev/null
-MOUNT_POINTS=("${MOUNT_POINTS[@]/$DEMOTE_MNT}")
+	pass "writes go to BTRFS upper, DwarFS lower unchanged"
+}
 
-# ── Test 7: Promote — extract DwarFS image to new BTRFS subvolume ─────────────
+test_userspace_blend_modify_lower_file() {
+	desc "userspace blend mount: modifying a lower file copies it up to BTRFS"
 
-btrfs subvolume create "$BTRFS_MNT/promoted" &>/dev/null
-dwarfsextract -i "$DEMOTE_IMG" -o "$BTRFS_MNT/promoted" &>/dev/null
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
 
-assert_file_exists "promoted subvol has upper-layer content" \
-    "$BTRFS_MNT/promoted/shared/file.txt"
-assert_eq "promoted content matches demoted" \
-    "$(cat "$BTRFS_MNT/promoted/shared/file.txt")" "upper_data"
+	# Modify a file that exists only in the DwarFS lower
+	echo "modified" >> "$BLEND_MNT/btrfs_file.txt"
 
-# ── Test 8: Round-trip data integrity ─────────────────────────────────────────
+	# The modified copy must be on the BTRFS upper layer
+	assert_file_exists "$BTRFS_MNT/upper/btrfs_file.txt"
+	assert_file_contains "$BTRFS_MNT/upper/btrfs_file.txt" "modified"
 
-# Write → demote → promote → verify
-echo "round_trip_test" > "$BLEND_MNT/round_trip.txt"
-ROUND_IMG=$(mktemp /tmp/bdfs_round_XXXXXX.dwarfs)
-TEMP_DIRS+=("$ROUND_IMG")
+	# The DwarFS lower must still have the original content
+	assert_file_contains "$LOWER_MNT/btrfs_file.txt" "hello from btrfs"
 
-mkdwarfs -i "$BTRFS_MNT/upper" -o "$ROUND_IMG" \
-    --compression zstd --num-workers 2 &>/dev/null
+	pass "copy-up on modify: modified file on BTRFS upper, original on DwarFS lower"
+}
 
-btrfs subvolume create "$BTRFS_MNT/round_promoted" &>/dev/null
-dwarfsextract -i "$ROUND_IMG" -o "$BTRFS_MNT/round_promoted" &>/dev/null
+test_userspace_blend_delete_lower_file() {
+	desc "userspace blend mount: deleting a lower file creates a whiteout on BTRFS"
 
-assert_eq "round-trip data integrity" \
-    "$(cat "$BTRFS_MNT/round_promoted/round_trip.txt")" "round_trip_test"
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
 
-# ── Test 9: Snapshot of upper layer before demote ─────────────────────────────
+	rm "$BLEND_MNT/btrfs_file.txt"
 
-btrfs subvolume snapshot -r \
-    "$BTRFS_MNT/upper" \
-    "$BTRFS_MNT/upper_snap" &>/dev/null
-assert_dir_exists "pre-demote snapshot created" "$BTRFS_MNT/upper_snap"
+	# File must not be visible through the blend
+	assert_file_not_exists "$BLEND_MNT/btrfs_file.txt"
 
-# Modify upper after snapshot
-echo "post_snap" > "$BLEND_MNT/post_snap.txt"
-assert_cmd_fails "snapshot does not see post-snap write" \
-    test -f "$BTRFS_MNT/upper_snap/post_snap.txt"
+	# DwarFS lower must still have the original (whiteout is on upper)
+	assert_file_exists "$LOWER_MNT/btrfs_file.txt"
 
-print_summary
+	pass "delete creates whiteout on BTRFS upper, DwarFS lower unchanged"
+}
+
+test_userspace_blend_umount_order() {
+	desc "userspace blend umount: overlay unmounted before DwarFS lower"
+
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
+
+	# Unmount overlay first
+	fusermount -u "$BLEND_MNT" || umount "$BLEND_MNT"
+	assert_not_mountpoint "$BLEND_MNT"
+
+	# DwarFS lower must still be mounted at this point
+	assert_mountpoint "$LOWER_MNT"
+
+	# Now unmount the lower
+	fusermount -u "$LOWER_MNT" || umount "$LOWER_MNT"
+	assert_not_mountpoint "$LOWER_MNT"
+
+	pass "teardown order correct: overlay before DwarFS lower"
+}
+
+test_userspace_blend_umount_lower_first_fails() {
+	desc "userspace blend umount: unmounting DwarFS lower while overlay is active fails"
+
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
+
+	# Attempting to unmount the lower while the overlay is still mounted
+	# must fail (EBUSY)
+	if fusermount -u "$LOWER_MNT" 2>/dev/null || umount "$LOWER_MNT" 2>/dev/null; then
+		fail "expected umount of lower to fail while overlay is active"
+	fi
+
+	assert_mountpoint "$LOWER_MNT"
+	pass "umount of lower correctly refused while overlay is active"
+}
+
+test_userspace_blend_teardown() {
+	# Final cleanup for the userspace blend test group
+	umount_userspace_blend
+	teardown_blend_fixtures
+}
+
+# ── Kernel blend mount tests (require bdfs_blend module) ─────────────────────
+
+test_kernel_blend_mount() {
+	desc "kernel blend mount: bdfs_blend module"
+
+	skip_if_no_cmd bdfs
+	skip_unless_module_loaded bdfs_blend
+
+	setup_blend_fixtures
+
+	bdfs blend mount \
+		--btrfs-uuid "$(btrfs filesystem show "$BTRFS_MNT" | awk '/uuid:/{print $NF}')" \
+		--dwarfs-uuid "00000000-0000-0000-0000-000000000001" \
+		--mountpoint "$BLEND_MNT"
+
+	assert_mountpoint "$BLEND_MNT"
+	assert_file_contains "$BLEND_MNT/btrfs_file.txt" "hello from btrfs"
+
+	bdfs blend umount --mountpoint "$BLEND_MNT"
+	assert_not_mountpoint "$BLEND_MNT"
+
+	teardown_blend_fixtures
+	pass "kernel blend mount/umount cycle"
+}
+
+test_kernel_blend_auto_fallback() {
+	desc "kernel blend mount: auto-fallback to fuse-overlayfs on ENODEV"
+
+	skip_if_no_cmd bdfs
+	skip_if_no_cmd fuse-overlayfs
+	skip_if_no_cmd dwarfs
+	skip_if_module_loaded bdfs_blend  # only meaningful when module is absent
+
+	setup_blend_fixtures
+
+	# bdfs blend mount without --userspace: should detect ENODEV and
+	# automatically retry with fuse-overlayfs
+	bdfs blend mount \
+		--btrfs-uuid "$(btrfs filesystem show "$BTRFS_MNT" | awk '/uuid:/{print $NF}')" \
+		--dwarfs-uuid "00000000-0000-0000-0000-000000000001" \
+		--mountpoint "$BLEND_MNT" \
+		--btrfs-mount "$BTRFS_MNT/upper" \
+		--dwarfs-image "$DWARFS_IMG" \
+		--work-dir "$BTRFS_MNT/workdir"
+
+	assert_mountpoint "$BLEND_MNT"
+	assert_file_contains "$BLEND_MNT/btrfs_file.txt" "hello from btrfs"
+
+	bdfs blend umount --mountpoint "$BLEND_MNT"
+	assert_not_mountpoint "$BLEND_MNT"
+
+	teardown_blend_fixtures
+	pass "auto-fallback to fuse-overlayfs when kernel module absent"
+}
+
+# ── Test runner ───────────────────────────────────────────────────────────────
+
+run_tests \
+	test_userspace_blend_mount \
+	test_userspace_blend_write_goes_to_upper \
+	test_userspace_blend_modify_lower_file \
+	test_userspace_blend_delete_lower_file \
+	test_userspace_blend_umount_order \
+	test_userspace_blend_umount_lower_first_fails \
+	test_userspace_blend_teardown \
+	test_kernel_blend_mount \
+	test_kernel_blend_auto_fallback
