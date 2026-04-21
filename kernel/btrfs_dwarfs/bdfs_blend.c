@@ -76,6 +76,17 @@
 /* Maximum xattr value size we handle inline (larger values use vmalloc). */
 #define BDFS_XATTR_INLINE_MAX  256
 
+/* Forward declarations for functions defined after the ops tables. */
+static ssize_t bdfs_blend_copy_file_range(struct file *file_in, loff_t pos_in,
+					  struct file *file_out, loff_t pos_out,
+					  size_t len, unsigned int flags);
+static long    bdfs_blend_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg);
+#ifdef CONFIG_COMPAT
+static long    bdfs_blend_compat_ioctl(struct file *file, unsigned int cmd,
+				       unsigned long arg);
+#endif
+
 /* Forward declarations for whiteout helpers (defined after readdir/lookup). */
 static char *bdfs_blend_whiteout_name(const char *name, size_t namelen,
 				      char *buf, size_t bufsz);
@@ -1881,6 +1892,188 @@ static int bdfs_blend_create_whiteout(struct inode *dir,
 	return ret;
 }
 
+/* ── copy_file_range ─────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_copy_file_range - Forward copy_file_range to the real files.
+ *
+ * Both source and destination must be on the upper (BTRFS) layer for an
+ * in-kernel copy to be possible.  If the source is on a lower (DwarFS) layer
+ * we fall back to the generic VFS implementation which reads and writes via
+ * read_iter/write_iter (triggering copy-up on the destination as needed).
+ *
+ * The fast path uses vfs_copy_file_range() on the real backing files so that
+ * BTRFS can use its native reflink/clone_range ioctl for zero-copy within
+ * the same filesystem.
+ *
+ * Kernel version notes:
+ *   vfs_copy_file_range() is stable across 5.15–6.15.
+ *   do_splice_direct() used in the fallback is also stable.
+ */
+static ssize_t bdfs_blend_copy_file_range(struct file *file_in,
+					  loff_t pos_in,
+					  struct file *file_out,
+					  loff_t pos_out,
+					  size_t len, unsigned int flags)
+{
+	struct bdfs_blend_inode_info *bi_in  = BDFS_I(file_inode(file_in));
+	struct bdfs_blend_inode_info *bi_out = BDFS_I(file_inode(file_out));
+	struct super_block *sb = file_inode(file_out)->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct file *real_in  = NULL;
+	struct file *real_out = NULL;
+	ssize_t ret;
+
+	/*
+	 * Destination must be on the upper layer (writes always go to BTRFS).
+	 * Trigger copy-up if it is currently lower-layer.
+	 */
+	if (!bi_out->is_upper) {
+		ret = bdfs_blend_trigger_copyup(file_inode(file_out), bm);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Fast path: both files are on the upper (BTRFS) layer.
+	 * Open real backing files and call vfs_copy_file_range so BTRFS can
+	 * use reflink/clone_range for a zero-copy operation.
+	 */
+	if (bi_in->is_upper && bi_out->is_upper) {
+		int in_flags  = O_RDONLY | O_LARGEFILE;
+		int out_flags = O_RDWR   | O_LARGEFILE;
+
+		real_in = bi_in->upper_file
+			  ? (get_file(bi_in->upper_file), bi_in->upper_file)
+			  : dentry_open(&bi_in->real_path, in_flags,
+					current_cred());
+		if (IS_ERR(real_in))
+			return PTR_ERR(real_in);
+
+		real_out = bi_out->upper_file
+			   ? (get_file(bi_out->upper_file), bi_out->upper_file)
+			   : dentry_open(&bi_out->real_path, out_flags,
+					 current_cred());
+		if (IS_ERR(real_out)) {
+			fput(real_in);
+			return PTR_ERR(real_out);
+		}
+
+		ret = vfs_copy_file_range(real_in, pos_in,
+					  real_out, pos_out, len, flags);
+		fput(real_in);
+		fput(real_out);
+		return ret;
+	}
+
+	/*
+	 * Slow path: source is on a lower (DwarFS) layer.  Fall back to the
+	 * generic implementation which uses read_iter + write_iter.  This is
+	 * correct but not zero-copy.
+	 */
+	return generic_copy_file_range(file_in, pos_in,
+				       file_out, pos_out, len, flags);
+}
+
+/* ── FS_IOC_GETFLAGS / FS_IOC_SETFLAGS ──────────────────────────────────── */
+
+/*
+ * bdfs_blend_ioctl - Forward FS_IOC_GETFLAGS and FS_IOC_SETFLAGS to the
+ * real backing inode.
+ *
+ * These ioctls read/write the inode flags word (FS_IMMUTABLE_FL,
+ * FS_APPEND_FL, FS_NOATIME_FL, etc.) stored in the real filesystem.
+ * We open the real file and call its ->unlocked_ioctl handler directly.
+ *
+ * FS_IOC_SETFLAGS on a lower-layer inode triggers copy-up first (the flag
+ * change is a mutation and must land on the BTRFS upper layer).
+ *
+ * Kernel version notes:
+ *   fileattr_get / fileattr_set (introduced in 5.13) are the modern
+ *   interface; FS_IOC_GETFLAGS/SETFLAGS are the legacy ioctl numbers that
+ *   BTRFS still handles via its ->unlocked_ioctl.  We use the ioctl path
+ *   because it works across all supported kernel versions (5.15–6.15) and
+ *   avoids the need to call ->fileattr_get/set which may not be set on the
+ *   DwarFS FUSE inode.
+ */
+static long bdfs_blend_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct file *real_file;
+	long ret;
+
+	switch (cmd) {
+	case FS_IOC_GETFLAGS:
+	case FS_IOC_SETFLAGS:
+#ifdef CONFIG_COMPAT
+	case FS_IOC32_GETFLAGS:
+	case FS_IOC32_SETFLAGS:
+#endif
+		break;
+	default:
+		return -ENOTTY;
+	}
+
+	/* Mutations require the upper layer; trigger copy-up if needed. */
+	if ((cmd == FS_IOC_SETFLAGS
+#ifdef CONFIG_COMPAT
+	     || cmd == FS_IOC32_SETFLAGS
+#endif
+	    ) && !bi->is_upper) {
+		ret = bdfs_blend_trigger_copyup(inode, bm);
+		if (ret)
+			return ret;
+	}
+
+	/* Open the real backing file. */
+	{
+		int open_flags = (cmd == FS_IOC_GETFLAGS
+#ifdef CONFIG_COMPAT
+				  || cmd == FS_IOC32_GETFLAGS
+#endif
+				 ) ? (O_RDONLY | O_LARGEFILE)
+				   : (O_RDWR   | O_LARGEFILE);
+
+		if (bi->is_upper && bi->upper_file) {
+			real_file = bi->upper_file;
+			get_file(real_file);
+		} else {
+			real_file = dentry_open(&bi->real_path, open_flags,
+						current_cred());
+			if (IS_ERR(real_file))
+				return PTR_ERR(real_file);
+		}
+	}
+
+	if (real_file->f_op && real_file->f_op->unlocked_ioctl)
+		ret = real_file->f_op->unlocked_ioctl(real_file, cmd, arg);
+	else
+		ret = -ENOTTY;
+
+	fput(real_file);
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+static long bdfs_blend_compat_ioctl(struct file *file, unsigned int cmd,
+				    unsigned long arg)
+{
+	/* Translate 32-bit ioctl numbers and forward. */
+	switch (cmd) {
+	case FS_IOC32_GETFLAGS:
+		return bdfs_blend_ioctl(file, FS_IOC_GETFLAGS, arg);
+	case FS_IOC32_SETFLAGS:
+		return bdfs_blend_ioctl(file, FS_IOC_SETFLAGS, arg);
+	default:
+		return -ENOIOCTLCMD;
+	}
+}
+#endif
+
 /* ── inode_operations / file_operations tables ───────────────────────────── */
 
 static const struct inode_operations bdfs_blend_symlink_iops = {
@@ -1897,12 +2090,17 @@ static const struct inode_operations bdfs_blend_file_iops = {
 };
 
 static const struct file_operations bdfs_blend_file_fops = {
-	.open       = bdfs_blend_open,
-	.read_iter  = generic_file_read_iter,
-	.write_iter = bdfs_blend_write_iter,
-	.mmap       = bdfs_blend_mmap,
-	.llseek     = generic_file_llseek,
-	.fsync      = bdfs_blend_fsync,
+	.open             = bdfs_blend_open,
+	.read_iter        = generic_file_read_iter,
+	.write_iter       = bdfs_blend_write_iter,
+	.mmap             = bdfs_blend_mmap,
+	.llseek           = generic_file_llseek,
+	.fsync            = bdfs_blend_fsync,
+	.copy_file_range  = bdfs_blend_copy_file_range,
+	.unlocked_ioctl   = bdfs_blend_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl     = bdfs_blend_compat_ioctl,
+#endif
 };
 
 static const struct file_operations bdfs_blend_dir_fops = {

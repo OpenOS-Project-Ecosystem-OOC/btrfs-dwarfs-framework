@@ -65,28 +65,73 @@ static void bdfs_handle_event(struct bdfs_daemon *d,
 	case BDFS_EVT_SNAPSHOT_EXPORTED: {
 		/*
 		 * Kernel has registered an export intent.  Parse the message
-		 * to extract subvol_id, image path, and compression.
+		 * to extract all export parameters.
 		 *
-		 * Message format:
-		 *   "export subvol=<id> image=<name> compression=<n>"
+		 * Message format (space-separated key=value):
+		 *   "export subvol=<id> image=<name> compression=<n>
+		 *           flags=<n> btrfs_mount=<path> [parent_snap=<path>]"
+		 *
+		 * We use strstr-based extraction rather than sscanf because
+		 * paths may not be the last field and sscanf %s stops at space.
 		 */
-		uint64_t subvol_id = 0;
-		char image_name[BDFS_NAME_MAX + 1] = {0};
+		uint64_t subvol_id   = 0;
 		uint32_t compression = BDFS_COMPRESS_ZSTD;
+		uint32_t flags       = 0;
+		char image_name[BDFS_NAME_MAX + 1] = {0};
+		char btrfs_mount[BDFS_PATH_MAX]    = {0};
+		char parent_snap[BDFS_PATH_MAX]    = {0};
+		const char *msg = evt->message;
 
-		sscanf(evt->message,
-		       "export subvol=%" SCNu64 " image=%255s compression=%u",
-		       &subvol_id, image_name, &compression);
+		/* Extract fixed-width numeric fields via sscanf first pass. */
+		sscanf(msg,
+		       "export subvol=%" SCNu64 " image=%255s compression=%u "
+		       "flags=%u",
+		       &subvol_id, image_name, &compression, &flags);
+
+		/* Extract path fields with strstr to handle embedded slashes. */
+		{
+			const char *p;
+			char *end;
+
+			p = strstr(msg, "btrfs_mount=");
+			if (p) {
+				p += strlen("btrfs_mount=");
+				end = strchr(p, ' ');
+				size_t l = end ? (size_t)(end - p)
+					       : strlen(p);
+				if (l >= sizeof(btrfs_mount))
+					l = sizeof(btrfs_mount) - 1;
+				memcpy(btrfs_mount, p, l);
+			}
+
+			p = strstr(msg, "parent_snap=");
+			if (p) {
+				p += strlen("parent_snap=");
+				end = strchr(p, ' ');
+				size_t l = end ? (size_t)(end - p)
+					       : strlen(p);
+				if (l >= sizeof(parent_snap))
+					l = sizeof(parent_snap) - 1;
+				memcpy(parent_snap, p, l);
+			}
+		}
 
 		job = bdfs_job_alloc(BDFS_JOB_EXPORT_TO_DWARFS);
 		if (!job) break;
 
 		memcpy(job->partition_uuid, evt->partition_uuid, 16);
 		job->object_id = evt->object_id;
-		job->export_to_dwarfs.subvol_id = subvol_id;
-		job->export_to_dwarfs.compression = compression;
+		job->export_to_dwarfs.subvol_id    = subvol_id;
+		job->export_to_dwarfs.compression  = compression;
+		job->export_to_dwarfs.flags        = flags;
 		strncpy(job->export_to_dwarfs.image_name, image_name,
 			sizeof(job->export_to_dwarfs.image_name) - 1);
+		strncpy(job->export_to_dwarfs.btrfs_mount, btrfs_mount,
+			sizeof(job->export_to_dwarfs.btrfs_mount) - 1);
+		if (parent_snap[0])
+			strncpy(job->export_to_dwarfs.parent_snap_path,
+				parent_snap,
+				sizeof(job->export_to_dwarfs.parent_snap_path) - 1);
 		break;
 	}
 
