@@ -17,11 +17,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <syslog.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -98,15 +100,338 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 	req[n] = '\0';
 
 	/*
-	 * Minimal command dispatch.  A production implementation would use
-	 * a proper JSON parser (e.g. cJSON or jsmn).  Here we do simple
-	 * string matching for the command field.
+	 * Command dispatch.  Uses simple string matching on the JSON "cmd"
+	 * field — sufficient given the fixed protocol schema.  A real JSON
+	 * parser (cJSON/jsmn) should replace this if the protocol grows.
+	 *
+	 * Field extraction helpers:
+	 *   str_field(req, key, buf, bufsz)  — extract a quoted string value
+	 *   int_field(req, key)              — extract an integer value
+	 *   bool_field(req, key)             — extract a boolean value
 	 */
-	if (strstr(req, "\"list-partitions\"")) {
-		snprintf(resp, sizeof(resp),
-			 "{\"status\":0,\"data\":{\"note\":\"use ioctl\"}}\n");
+#define str_field(req, key, buf, bufsz) do { \
+	char *_p = strstr((req), "\"" key "\":\""); \
+	if (_p) { \
+		_p += strlen("\"" key "\":\""); \
+		char *_e = strchr(_p, '"'); \
+		if (_e) { \
+			size_t _l = (size_t)(_e - _p); \
+			if (_l >= (bufsz)) _l = (bufsz) - 1; \
+			strncpy((buf), _p, _l); \
+			(buf)[_l] = '\0'; \
+		} \
+	} \
+} while (0)
 
-	} else if (strstr(req, "\"status\"")) {
+#define int_field(req, key) ({ \
+	int _v = 0; \
+	char *_p = strstr((req), "\"" key "\":"); \
+	if (_p) _v = atoi(_p + strlen("\"" key "\":")); \
+	_v; \
+})
+
+#define bool_field(req, key) (!!strstr((req), "\"" key "\":true"))
+
+	if (strstr(req, "\"cmd\":\"list_partitions\"") ||
+	    strstr(req, "\"list-partitions\"")) {
+		/*
+		 * Walk /proc/mounts for btrfs entries and return their
+		 * device paths.  Falls back to an empty list on error.
+		 */
+		FILE *mf = fopen("/proc/mounts", "r");
+		char *pos = resp;
+		size_t rem = sizeof(resp);
+		int written = snprintf(pos, rem,
+				       "{\"status\":0,\"data\":{\"partitions\":[");
+		pos += written; rem -= written;
+		int first = 1;
+		if (mf) {
+			char line[512];
+			while (fgets(line, sizeof(line), mf) && rem > 4) {
+				char dev[256] = {0}, mnt[256] = {0}, fs[32] = {0};
+				if (sscanf(line, "%255s %255s %31s", dev, mnt, fs) == 3
+				    && strcmp(fs, "btrfs") == 0) {
+					written = snprintf(pos, rem, "%s\"%s\"",
+							   first ? "" : ",", dev);
+					pos += written; rem -= written;
+					first = 0;
+				}
+			}
+			fclose(mf);
+		}
+		snprintf(pos, rem, "]}}\n");
+
+	} else if (strstr(req, "\"cmd\":\"list_images\"")) {
+		/*
+		 * Return .dwarfs files found under the configured archive
+		 * directory (cfg.archive_dir, default /var/lib/bdfs/archives).
+		 */
+		const char *archive_dir = d->cfg.archive_dir[0]
+					  ? d->cfg.archive_dir
+					  : "/var/lib/bdfs/archives";
+		char *pos = resp;
+		size_t rem = sizeof(resp);
+		int written = snprintf(pos, rem,
+				       "{\"status\":0,\"data\":{\"images\":[");
+		pos += written; rem -= written;
+
+		DIR *dir = opendir(archive_dir);
+		int first = 1;
+		if (dir) {
+			struct dirent *de;
+			while ((de = readdir(dir)) != NULL && rem > 4) {
+				size_t nlen = strlen(de->d_name);
+				if (nlen > 7 &&
+				    strcmp(de->d_name + nlen - 7, ".dwarfs") == 0) {
+					written = snprintf(pos, rem, "%s\"%s/%s\"",
+							   first ? "" : ",",
+							   archive_dir, de->d_name);
+					pos += written; rem -= written;
+					first = 0;
+				}
+			}
+			closedir(dir);
+		}
+		snprintf(pos, rem, "]}}\n");
+
+	} else if (strstr(req, "\"cmd\":\"list_mounts\"")) {
+		/* Return all currently tracked blend mount points. */
+		char *pos = resp;
+		size_t rem = sizeof(resp);
+		int written = snprintf(pos, rem,
+				       "{\"status\":0,\"data\":{\"mounts\":[");
+		pos += written; rem -= written;
+
+		pthread_mutex_lock(&d->mounts_lock);
+		struct bdfs_mount_entry *e;
+		int first = 1;
+		TAILQ_FOREACH(e, &d->mounts, entry) {
+			if (rem <= 4) break;
+			written = snprintf(pos, rem, "%s\"%s\"",
+					   first ? "" : ",", e->mount_point);
+			pos += written; rem -= written;
+			first = 0;
+		}
+		pthread_mutex_unlock(&d->mounts_lock);
+		snprintf(pos, rem, "]}}\n");
+
+	} else if (strstr(req, "\"cmd\":\"blend_mount\"")) {
+		char image[BDFS_PATH_MAX]   = {0};
+		char subvol[BDFS_PATH_MAX]  = {0};
+		char mp[BDFS_PATH_MAX]      = {0};
+		bool userspace = bool_field(req, "userspace");
+
+		str_field(req, "image",      image,  sizeof(image));
+		str_field(req, "subvol",     subvol, sizeof(subvol));
+		str_field(req, "mountpoint", mp,     sizeof(mp));
+
+		if (!image[0] || !subvol[0] || !mp[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"image, subvol and mountpoint required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(
+			userspace ? BDFS_JOB_MOUNT_BLEND_USERSPACE
+				  : BDFS_JOB_MOUNT_BLEND);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+
+		if (userspace) {
+			strncpy(job->mount_blend_userspace.dwarfs_image, image,
+				BDFS_PATH_MAX - 1);
+			strncpy(job->mount_blend_userspace.btrfs_upper, subvol,
+				BDFS_PATH_MAX - 1);
+			strncpy(job->mount_blend_userspace.blend_mount, mp,
+				BDFS_PATH_MAX - 1);
+		} else {
+			strncpy(job->mount_blend.dwarfs_mount, image,
+				BDFS_PATH_MAX - 1);
+			strncpy(job->mount_blend.btrfs_mount, subvol,
+				BDFS_PATH_MAX - 1);
+			strncpy(job->mount_blend.blend_mount, mp,
+				BDFS_PATH_MAX - 1);
+		}
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\",\"data\":{\"mountpoint\":\"%s\"}}\n", mp);
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"umount\"")) {
+		char mp[BDFS_PATH_MAX] = {0};
+		str_field(req, "mountpoint", mp, sizeof(mp));
+
+		if (!mp[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"mountpoint required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_UMOUNT_BLEND);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+		strncpy(job->umount_dwarfs.mount_point, mp, BDFS_PATH_MAX - 1);
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp), "{\"status\":\"ok\"}\n");
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"mount\"")) {
+		/* Mount a bare DwarFS image (no blend). */
+		char image[BDFS_PATH_MAX] = {0};
+		char mp[BDFS_PATH_MAX]    = {0};
+		int  cache_mb = int_field(req, "cache_size_mb");
+
+		str_field(req, "image",      image, sizeof(image));
+		str_field(req, "mountpoint", mp,    sizeof(mp));
+
+		if (!image[0] || !mp[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"image and mountpoint required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_MOUNT_DWARFS);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+		strncpy(job->mount_dwarfs.image_path,  image, BDFS_PATH_MAX - 1);
+		strncpy(job->mount_dwarfs.mount_point, mp,    BDFS_PATH_MAX - 1);
+		job->mount_dwarfs.cache_size_mb = cache_mb > 0 ? (uint32_t)cache_mb : 256;
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\",\"data\":{\"mountpoint\":\"%s\"}}\n", mp);
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"import\"")) {
+		char image[BDFS_PATH_MAX]  = {0};
+		char target[BDFS_PATH_MAX] = {0};
+		char btrfs[BDFS_PATH_MAX]  = {0};
+
+		str_field(req, "image",  image,  sizeof(image));
+		str_field(req, "target", target, sizeof(target));
+		str_field(req, "btrfs",  btrfs,  sizeof(btrfs));
+
+		if (!image[0] || !target[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"image and target required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_IMPORT_FROM_DWARFS);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+		strncpy(job->import_from_dwarfs.image_path,  image,  BDFS_PATH_MAX - 1);
+		strncpy(job->import_from_dwarfs.subvol_name, target, BDFS_NAME_MAX);
+		if (btrfs[0])
+			strncpy(job->import_from_dwarfs.btrfs_mount, btrfs,
+				BDFS_PATH_MAX - 1);
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\",\"data\":{\"target\":\"%s\"}}\n", target);
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"demote\"")) {
+		char subvol[BDFS_PATH_MAX] = {0};
+		char output[BDFS_PATH_MAX] = {0};
+		char btrfs[BDFS_PATH_MAX]  = {0};
+
+		str_field(req, "subvol", subvol, sizeof(subvol));
+		str_field(req, "output", output, sizeof(output));
+		str_field(req, "btrfs",  btrfs,  sizeof(btrfs));
+
+		if (!subvol[0] || !output[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"subvol and output required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_EXPORT_TO_DWARFS);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+		if (btrfs[0])
+			strncpy(job->export_to_dwarfs.btrfs_mount, btrfs,
+				BDFS_PATH_MAX - 1);
+		strncpy(job->export_to_dwarfs.image_path, output, BDFS_PATH_MAX - 1);
+		/* subvol_id 0 means the job handler resolves by path */
+		job->export_to_dwarfs.subvol_id = 0;
+		/* Store subvol path in image_name as a hint for the handler */
+		strncpy(job->export_to_dwarfs.image_name, subvol, BDFS_NAME_MAX);
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\",\"data\":{\"output\":\"%s\"}}\n", output);
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"prune\"")) {
+		char subvol[BDFS_PATH_MAX]   = {0};
+		char pattern[256]            = {0};
+		int  keep        = int_field(req, "keep");
+		bool demote_first = bool_field(req, "demote_first");
+		bool dry_run      = bool_field(req, "dry_run");
+
+		str_field(req, "subvol",  subvol,  sizeof(subvol));
+		str_field(req, "pattern", pattern, sizeof(pattern));
+
+		if (!subvol[0] || keep <= 0) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":\"subvol and keep > 0 required\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_PRUNE);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+		strncpy(job->prune.btrfs_mount,   subvol,  BDFS_PATH_MAX - 1);
+		strncpy(job->prune.name_pattern,  pattern, sizeof(job->prune.name_pattern) - 1);
+		job->prune.keep_count = (uint32_t)keep;
+		if (demote_first) job->prune.flags |= BDFS_PRUNE_DEMOTE_FIRST;
+		if (dry_run)      job->prune.flags |= BDFS_PRUNE_DRY_RUN;
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp), "{\"status\":\"ok\"}\n");
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
+	} else if (strstr(req, "\"cmd\":\"status\"") ||
+		   strstr(req, "\"status\"")) {
 		/* Count queued jobs */
 		int queue_depth = 0;
 		pthread_mutex_lock(&d->queue_lock);
@@ -132,9 +457,6 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 			 bdfs_mount_count(d),
 			 (unsigned long long)total_demotes,
 			 (long long)last_scan);
-
-	} else if (strstr(req, "\"ping\"")) {
-		snprintf(resp, sizeof(resp), "{\"status\":0,\"data\":\"pong\"}\n");
 
 	} else if (strstr(req, "\"policy-add\"")) {
 		/*
@@ -254,6 +576,10 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 				 "\"policy engine not running\"}\n");
 		}
 
+	} else if (strstr(req, "\"cmd\":\"ping\"") ||
+		   strstr(req, "\"ping\"")) {
+		snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"data\":\"pong\"}\n");
+
 	} else {
 		status = -ENOSYS;
 		snprintf(resp, sizeof(resp),
@@ -261,6 +587,7 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 			 status);
 	}
 
+send:
 	send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
 
 out:
