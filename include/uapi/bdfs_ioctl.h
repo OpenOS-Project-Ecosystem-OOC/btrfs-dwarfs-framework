@@ -91,6 +91,55 @@ struct bdfs_ioctl_mount_blend_userspace {
 #define BDFS_IOC_MOUNT_BLEND_USERSPACE \
 	_IOW(BDFS_IOCTL_MAGIC, 0x06, struct bdfs_ioctl_mount_blend_userspace)
 
+/*
+ * BDFS_IOC_BLEND_ATTACH_MOUNTS — called by the daemon after it has mounted
+ * the BTRFS upper layer and all DwarFS lower layers.  Passes open O_PATH
+ * file descriptors for each vfsmount back to the kernel so the blend layer
+ * can hold proper mntget() references and use them for VFS operations.
+ *
+ * The daemon opens each mount point with open(O_PATH) and passes the fd here.
+ * The kernel calls fdget() to obtain the vfsmount, calls mntget(), then
+ * releases the fd reference.  This avoids kern_mount() in the kernel and lets
+ * the daemon control the actual mount lifecycle.
+ *
+ * dwarfs_fds[0..n_dwarfs-1] are the DwarFS FUSE mount fds in layer order.
+ * n_dwarfs must be ≤ BDFS_MAX_DWARFS_LAYERS.
+ */
+#define BDFS_MAX_DWARFS_LAYERS  8
+
+struct bdfs_ioctl_blend_attach_mounts {
+	char  mount_point[BDFS_PATH_MAX]; /* identifies which bm to update */
+	int   btrfs_fd;                   /* O_PATH fd for BTRFS upper mount */
+	__u32 n_dwarfs;                   /* number of DwarFS layer fds */
+	int   dwarfs_fds[BDFS_MAX_DWARFS_LAYERS]; /* O_PATH fds, in order */
+};
+
+#define BDFS_IOC_BLEND_ATTACH_MOUNTS \
+	_IOW(BDFS_IOCTL_MAGIC, 0x07, struct bdfs_ioctl_blend_attach_mounts)
+
+/*
+ * BDFS_IOC_SETXATTR / BDFS_IOC_GETXATTR — set/get an xattr on a blend inode
+ * by blend-namespace path.  Used by offline tooling that cannot use the
+ * standard setxattr(2)/getxattr(2) syscalls directly on the blend mount.
+ *
+ * For normal in-kernel xattr operations on a mounted blend filesystem the
+ * standard syscalls are routed through bdfs_blend_setxattr/getxattr
+ * automatically via the s_xattr handler table — no ioctl needed.
+ */
+struct bdfs_ioctl_xattr {
+	char  mount_point[BDFS_PATH_MAX]; /* blend mount point */
+	char  path[BDFS_PATH_MAX];        /* path relative to blend mount */
+	char  name[256];                  /* xattr name (e.g. "user.foo") */
+	__u32 size;                       /* value buf size (in) / actual (out) */
+	__u32 flags;                      /* XATTR_CREATE / XATTR_REPLACE (set) */
+	__u8  value[65536];               /* value buffer */
+};
+
+#define BDFS_IOC_SETXATTR \
+	_IOW(BDFS_IOCTL_MAGIC, 0x08, struct bdfs_ioctl_xattr)
+#define BDFS_IOC_GETXATTR \
+	_IOWR(BDFS_IOCTL_MAGIC, 0x09, struct bdfs_ioctl_xattr)
+
 /* ── DwarFS-backed partition ioctls ────────────────────────────────────── */
 
 /*

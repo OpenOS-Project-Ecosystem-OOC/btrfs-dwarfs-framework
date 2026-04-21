@@ -101,6 +101,7 @@ int bdfs_btrfs_list_subvols(void __user *uarg,
 int  bdfs_blend_init(void);
 void bdfs_blend_exit(void);
 
+int bdfs_blend_attach_mounts(void __user *uarg);
 int bdfs_blend_mount(void __user *uarg,
 		     struct list_head *registry,
 		     struct mutex *lock);
