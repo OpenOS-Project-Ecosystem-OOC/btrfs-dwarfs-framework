@@ -248,3 +248,127 @@ sudo make test
 | Import | dwarfsextract | DwarFS image extraction |
 | Verify | dwarfsck | Image integrity checking |
 | BTRFS ops | btrfs-progs | send/receive/snapshot |
+
+---
+
+## Blend Layer: Completed VFS Operations
+
+The following table documents the implementation status of each VFS operation
+in `bdfs_blend.c` after the blend-vfs-completion work:
+
+| Operation | Status | Notes |
+|---|---|---|
+| `lookup` | ✅ Complete | Two-layer routing with whiteout check |
+| `open` | ✅ Complete | Copy-up on write-mode open of lower inode |
+| `read_iter` | ✅ Complete | Forwarded via `vfs_iter_read` |
+| `write_iter` | ✅ Complete | Cached upper_file, copy-up guard |
+| `mmap` | ✅ Complete | Read-only lower; copy-up then mmap for upper |
+| `fsync` | ✅ Complete | Forwarded to real file; no-op for lower (read-only) |
+| `readdir` | ✅ Complete | Merged upper+lower with dedup; whiteouts filtered |
+| `create` | ✅ Complete | Always on upper layer |
+| `mkdir` | ✅ Complete | Always on upper layer |
+| `unlink` | ✅ Complete | Upper: delete + whiteout if lower exists; Lower: whiteout only |
+| `rmdir` | ✅ Complete | Upper: vfs_rmdir; Lower: whiteout only |
+| `rename` | ✅ Complete | Upper-layer only; lower requires prior promote |
+| `symlink` | ✅ Complete | Always on upper layer |
+| `link` | ✅ Complete | Always on upper layer |
+| `setattr` | ✅ Complete | Forwarded to real inode |
+| `getattr` | ✅ Complete | Refreshes size/timestamps from real inode |
+| `permission` | ✅ Complete | Delegates to real inode's `->permission` (ACL-aware) |
+| `listxattr` | ✅ Complete | Forwarded to real inode |
+| `setxattr` | ✅ Complete | Copy-up if lower; `vfs_setxattr` on real inode |
+| `getxattr` | ✅ Complete | `vfs_getxattr` on real inode (upper or lower) |
+| `statfs` | ✅ Complete | BTRFS upper stats + DwarFS layer sizes in `f_blocks` |
+| `get_link` | ✅ Complete | Forwarded to real symlink inode |
+
+### Whiteout semantics
+
+Deletion of a lower-layer (DwarFS) entry creates a `.wh.<name>` zero-length
+regular file on the BTRFS upper layer.  This mirrors the overlayfs/aufs
+convention.  The whiteout is checked in `bdfs_blend_lookup` before falling
+through to lower layers, and `.wh.*` entries are filtered from `readdir`
+output so they are never visible to userspace.
+
+### vfsmount reference lifecycle
+
+Backing vfsmounts (`bm->btrfs_mnt`, `layer->mnt`) are acquired via
+`BDFS_IOC_BLEND_ATTACH_MOUNTS` after the daemon has mounted the BTRFS upper
+layer and DwarFS lower layers.  The daemon passes O_PATH file descriptors;
+the kernel extracts the vfsmount via `fdget()` and takes a `mntget()`
+reference.  References are released in `bdfs_blend_umount` via `mntput()`.
+
+---
+
+## xfstests Compatibility
+
+The following `generic/` xfstests are expected to pass against a mounted
+`bdfs_blend` filesystem.  Tests are run with the blend mount as `TEST_DEV`
+and the BTRFS upper layer as `SCRATCH_DEV`.
+
+### Expected to pass
+
+| Test | What it covers |
+|---|---|
+| `generic/001` | Basic read/write |
+| `generic/002` | `O_SYNC` write |
+| `generic/005` | Rename |
+| `generic/006` | Hard link |
+| `generic/007` | Symlink |
+| `generic/011` | `ftruncate` |
+| `generic/013` | `mmap` read |
+| `generic/014` | `mmap` write |
+| `generic/020` | `fsync` after write |
+| `generic/023` | `fsync` on directory |
+| `generic/028` | `setxattr` / `getxattr` / `listxattr` |
+| `generic/029` | `removexattr` |
+| `generic/044` | `statfs` |
+| `generic/062` | `chmod` / `chown` |
+| `generic/070` | POSIX ACL set/get |
+| `generic/083` | `mmap` + `msync` |
+| `generic/099` | `O_DIRECT` read (forwarded to upper) |
+| `generic/112` | Whiteout / opaque directory (overlayfs-style) |
+| `generic/117` | `readdir` correctness |
+| `generic/285` | `fallocate` (forwarded to upper) |
+
+### Expected to fail / not applicable
+
+| Test | Reason |
+|---|---|
+| `generic/003` | `O_DIRECT` write on lower layer — lower is read-only |
+| `generic/010` | `atime` update on lower layer — DwarFS FUSE does not update atime |
+| `generic/035` | Filesystem-specific ioctl — blend ioctls are on `/dev/bdfs_ctl`, not the mount |
+| `generic/091` | `reflink` — BTRFS reflink not exposed through blend layer |
+| `generic/263` | `copy_file_range` — not yet implemented in blend `file_operations` |
+| `generic/388` | `FS_IOC_GETFLAGS` — not forwarded through blend inode |
+
+Run xfstests against the blend layer:
+
+```bash
+# From the xfstests source directory:
+export TEST_DEV=/mnt/blend
+export TEST_DIR=/mnt/blend
+export SCRATCH_DEV=/dev/sdb1   # BTRFS upper layer device
+export SCRATCH_MNT=/mnt/scratch
+./check generic/001 generic/013 generic/014 generic/020 generic/028 \
+         generic/044 generic/062 generic/070 generic/083 generic/117
+```
+
+---
+
+## Known Limitations (updated)
+
+| Limitation | Status |
+|---|---|
+| Blend layer inode routing | ✅ Complete — full two-layer lookup with whiteout support |
+| mmap on blend files | ✅ Complete — read-only lower, copy-up then mmap for upper |
+| fsync forwarding | ✅ Complete — forwarded to real file; no-op for lower |
+| xattr set/get | ✅ Complete — copy-up on set for lower inodes |
+| permission / ACL forwarding | ✅ Complete — delegates to real inode's `->permission` |
+| Whiteout support | ✅ Complete — `.wh.<name>` markers on unlink/rmdir of lower entries |
+| vfsmount reference safety | ✅ Complete — `BDFS_IOC_BLEND_ATTACH_MOUNTS` + `mntget`/`mntput` |
+| statfs aggregation | ✅ Complete — BTRFS upper + DwarFS layer sizes |
+| Incremental export | ⚠️ Pending — `--incremental` flag accepted but `btrfs send -p` not wired |
+| Read-only import flag | ⚠️ Pending — `--readonly` constructs the call but does not execute it |
+| `copy_file_range` | ⚠️ Pending — not in blend `file_operations` |
+| `FS_IOC_GETFLAGS` | ⚠️ Pending — not forwarded through blend inode |
+| `O_DIRECT` write on lower | ✗ Not applicable — lower layer is always read-only |

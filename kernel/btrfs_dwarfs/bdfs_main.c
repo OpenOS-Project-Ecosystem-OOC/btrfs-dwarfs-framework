@@ -255,6 +255,9 @@ static long bdfs_ctl_ioctl(struct file *file, unsigned int cmd,
 	case BDFS_IOC_UMOUNT_BLEND:
 		return bdfs_blend_umount(uarg);
 
+	case BDFS_IOC_BLEND_ATTACH_MOUNTS:
+		return bdfs_blend_attach_mounts(uarg);
+
 	/* DwarFS-backed partition ioctls */
 	case BDFS_IOC_EXPORT_TO_DWARFS:
 		return bdfs_dwarfs_export(uarg, &bdfs_partition_list,

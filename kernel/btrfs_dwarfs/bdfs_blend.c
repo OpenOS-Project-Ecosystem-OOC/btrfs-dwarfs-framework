@@ -45,6 +45,12 @@
 #include <linux/file.h>
 #include <linux/writeback.h>
 #include <linux/version.h>
+#include <linux/mm.h>
+#include <linux/mman.h>
+#include <linux/math64.h>
+#include <linux/security.h>
+#include <linux/posix_acl.h>
+#include <linux/posix_acl_xattr.h>
 
 #include "bdfs_internal.h"
 
@@ -54,6 +60,31 @@
 /* Layer identifiers for bdfs_ioctl_resolve_path.layer (0=btrfs, 1=dwarfs) */
 #define BDFS_LAYER_UPPER    0
 #define BDFS_LAYER_LOWER    1
+
+/*
+ * Whiteout marker prefix.  When a file is deleted from the blend namespace
+ * we create a zero-length regular file named ".wh.<name>" on the BTRFS upper
+ * layer.  During lookup, if the upper layer contains a whiteout for a name
+ * that exists on a lower layer, the lower-layer entry is hidden.
+ *
+ * This mirrors the overlayfs / aufs convention so that existing tooling
+ * (e.g. container image builders) can reason about the upper layer.
+ */
+#define BDFS_WH_PREFIX      ".wh."
+#define BDFS_WH_PREFIX_LEN  4
+
+/* Maximum xattr value size we handle inline (larger values use vmalloc). */
+#define BDFS_XATTR_INLINE_MAX  256
+
+/* Forward declarations for whiteout helpers (defined after readdir/lookup). */
+static char *bdfs_blend_whiteout_name(const char *name, size_t namelen,
+				      char *buf, size_t bufsz);
+static bool  bdfs_blend_is_whiteout(struct dentry *dentry);
+static bool  bdfs_blend_check_whiteout(struct bdfs_blend_inode_info *parent_bi,
+					const char *name, size_t namelen);
+static int   bdfs_blend_create_whiteout(struct inode *dir,
+					const char *name, size_t namelen,
+					struct bdfs_blend_mount *bm);
 
 /*
  * SLAB_MEM_SPREAD was removed in kernel 6.15.  It was a no-op hint on most
@@ -155,27 +186,56 @@ struct inode *bdfs_copyup_lookup_and_remove(const u8 uuid[16], u64 ino)
 static int bdfs_blend_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	/*
-	 * Report aggregate stats: capacity from BTRFS upper layer,
-	 * used space includes both BTRFS live data and DwarFS image sizes.
+	 * Report aggregate stats: capacity and free space from the BTRFS upper
+	 * layer (where all writes land), plus DwarFS lower-layer sizes added
+	 * to f_blocks for informational purposes.
+	 *
+	 * f_type is overridden to BDFS_BLEND_MAGIC so statfs(2) callers can
+	 * identify the blend filesystem rather than seeing BTRFS_SUPER_MAGIC.
 	 */
 	struct super_block *sb = dentry->d_sb;
 	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct bdfs_dwarfs_layer *layer;
 	struct path btrfs_root;
+	struct kstatfs layer_stat;
 	int ret;
 
 	if (!bm || !bm->btrfs_mnt)
 		return -EIO;
 
-	/*
-	 * Pass the BTRFS mount root directly.  The previous code chained
-	 * mnt_root->d_sb->s_root->d_sb->s_root which double-dereferenced
-	 * through the superblock and produced a stale or wrong dentry.
-	 */
 	btrfs_root.mnt    = bm->btrfs_mnt;
 	btrfs_root.dentry = bm->btrfs_mnt->mnt_root;
 	ret = vfs_statfs(&btrfs_root, buf);
+	if (ret)
+		return ret;
+
 	buf->f_type = BDFS_BLEND_MAGIC;
-	return ret;
+
+	/*
+	 * Add DwarFS image sizes to f_blocks (informational).  The images
+	 * live on the BTRFS partition so their bytes are already counted in
+	 * BTRFS used-space; we only adjust f_blocks upward so that df(1)
+	 * shows a "total" that accounts for the compressed archive data.
+	 * f_bfree and f_bavail are left unchanged (BTRFS figures are correct).
+	 */
+	list_for_each_entry(layer, &bm->dwarfs_layers, list) {
+		struct path layer_root;
+
+		if (!layer->mnt)
+			continue;
+		layer_root.mnt    = layer->mnt;
+		layer_root.dentry = layer->mnt->mnt_root;
+		if (vfs_statfs(&layer_root, &layer_stat))
+			continue;
+		if (buf->f_bsize > 0 && layer_stat.f_bsize > 0) {
+			u64 layer_bytes = (u64)layer_stat.f_blocks *
+					  layer_stat.f_bsize;
+			buf->f_blocks += div64_u64(layer_bytes,
+						   (u64)buf->f_bsize);
+		}
+	}
+
+	return 0;
 }
 
 static void bdfs_blend_put_super(struct super_block *sb)
@@ -443,7 +503,24 @@ static struct dentry *bdfs_blend_lookup(struct inode *dir,
 	}
 
 	/*
-	 * Step 2: Fall through to DwarFS lower layers in priority order.
+	 * Step 2: Check for a whiteout on the upper layer before falling
+	 * through to lower layers.  A whiteout (".wh.<name>") means the
+	 * entry was explicitly deleted from the blend namespace; we must
+	 * hide any lower-layer entry with the same name.
+	 *
+	 * We only check when the upper layer is available and the parent
+	 * directory is on the upper layer (if the parent is lower-only,
+	 * no whiteout can exist for this name yet).
+	 */
+	if (bm->btrfs_mnt && parent_bi->is_upper &&
+	    bdfs_blend_check_whiteout(parent_bi, name, strlen(name))) {
+		kfree(relpath_buf);
+		d_add(dentry, NULL);
+		return NULL;
+	}
+
+	/*
+	 * Step 3: Fall through to DwarFS lower layers in priority order.
 	 *
 	 * Resolve the full relative path from each layer's root so that
 	 * nested directories (e.g. "usr/lib/foo.so") are found correctly
@@ -833,34 +910,114 @@ static int bdfs_blend_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct bdfs_blend_inode_info *bi = BDFS_I(d_inode(dentry));
 	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct super_block *sb = dir->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
 	struct mnt_idmap *idmap;
+	int ret;
 
-	if (!bi->is_upper)
-		return -EPERM;	/* must promote before deleting */
+	if (bi->is_upper) {
+		/*
+		 * Upper-layer file: delete it directly.  If a lower-layer
+		 * entry with the same name exists, also create a whiteout so
+		 * the lower entry stays hidden after the upper one is gone.
+		 */
+		idmap = mnt_idmap(bi->real_path.mnt);
+		ret = vfs_unlink(idmap,
+				 d_inode(parent_bi->real_path.dentry),
+				 bi->real_path.dentry,
+				 NULL);
+		if (ret)
+			return ret;
 
-	idmap = mnt_idmap(bi->real_path.mnt);
-	return vfs_unlink(idmap,
-			  d_inode(parent_bi->real_path.dentry),
-			  bi->real_path.dentry,
-			  NULL);
+		/*
+		 * Create a whiteout if a lower-layer entry exists with this
+		 * name.  Failure is non-fatal: the upper entry is already
+		 * gone; the whiteout just prevents the lower entry from
+		 * reappearing.  Log a warning so the operator is aware.
+		 */
+		{
+			const char *name = dentry->d_name.name;
+			size_t namelen = dentry->d_name.len;
+			struct bdfs_dwarfs_layer *layer;
+			bool lower_exists = false;
+			char *rbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+
+			if (rbuf) {
+				char *rp = bdfs_blend_rel_path(dentry, rbuf,
+							       PATH_MAX);
+				if (!IS_ERR(rp)) {
+					list_for_each_entry(layer,
+							    &bm->dwarfs_layers,
+							    list) {
+						struct path lp;
+
+						if (!layer->mnt)
+							continue;
+						if (!vfs_path_lookup(
+							layer->mnt->mnt_root,
+							layer->mnt, rp, 0,
+							&lp)) {
+							lower_exists =
+							  d_is_positive(lp.dentry);
+							path_put(&lp);
+							if (lower_exists)
+								break;
+						}
+					}
+				}
+				kfree(rbuf);
+			}
+
+			if (lower_exists) {
+				int wret = bdfs_blend_create_whiteout(
+						dir, name, namelen, bm);
+				if (wret)
+					pr_warn("bdfs: whiteout for '%s' failed: %d\n",
+						name, wret);
+			}
+		}
+		return 0;
+	}
+
+	/*
+	 * Lower-layer file: we cannot delete it (DwarFS is read-only).
+	 * Create a whiteout on the upper layer so the entry is hidden.
+	 * This is the overlayfs model: deletion of a lower-layer entry
+	 * is represented by a ".wh.<name>" marker on the upper layer.
+	 */
+	return bdfs_blend_create_whiteout(dir,
+					  dentry->d_name.name,
+					  dentry->d_name.len,
+					  bm);
 }
 
 /*
- * bdfs_blend_rmdir - Remove a directory from the BTRFS upper layer.
+ * bdfs_blend_rmdir - Remove a directory from the blend namespace.
+ *
+ * Upper-layer directories are removed directly via vfs_rmdir.
+ * Lower-layer directories (DwarFS, read-only) are hidden by creating a
+ * whiteout on the upper layer, consistent with bdfs_blend_unlink.
  */
 static int bdfs_blend_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct bdfs_blend_inode_info *bi = BDFS_I(d_inode(dentry));
 	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	struct super_block *sb = dir->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
 	struct mnt_idmap *idmap;
 
-	if (!bi->is_upper)
-		return -EPERM;
+	if (bi->is_upper) {
+		idmap = mnt_idmap(bi->real_path.mnt);
+		return vfs_rmdir(idmap,
+				 d_inode(parent_bi->real_path.dentry),
+				 bi->real_path.dentry);
+	}
 
-	idmap = mnt_idmap(bi->real_path.mnt);
-	return vfs_rmdir(idmap,
-			 d_inode(parent_bi->real_path.dentry),
-			 bi->real_path.dentry);
+	/* Lower-layer directory: create a whiteout to hide it. */
+	return bdfs_blend_create_whiteout(dir,
+					  dentry->d_name.name,
+					  dentry->d_name.len,
+					  bm);
 }
 
 /*
@@ -1155,11 +1312,47 @@ static bool bdfs_filldir(struct dir_context *ctx, const char *name, int namlen,
 	struct bdfs_readdir_ctx *rc =
 		container_of(ctx, struct bdfs_readdir_ctx, ctx);
 
-	if (rc->dedup && bdfs_dedup_test_set(rc, name, namlen))
-		return true; /* skip duplicate; continue iteration */
+	/*
+	 * Never expose whiteout marker files (".wh.<name>") to userspace.
+	 * They are an internal implementation detail of the blend layer.
+	 */
+	if (namlen > BDFS_WH_PREFIX_LEN &&
+	    memcmp(name, BDFS_WH_PREFIX, BDFS_WH_PREFIX_LEN) == 0)
+		return true; /* skip; continue iteration */
 
-	if (!rc->dedup)
-		bdfs_dedup_test_set(rc, name, namlen); /* record for lower pass */
+	if (rc->dedup) {
+		/*
+		 * Lower-layer pass: skip entries already seen in the upper
+		 * layer (dedup) and entries that have a whiteout in the upper
+		 * layer (the whiteout name ".wh.<name>" was recorded in seen[]
+		 * during the upper pass via bdfs_dedup_test_set).
+		 *
+		 * We synthesise the whiteout name and check the dedup bitmap.
+		 * This is a probabilistic check (hash collision possible) but
+		 * false positives only suppress lower entries that happen to
+		 * collide — they remain accessible via lookup.
+		 */
+		char wh_buf[NAME_MAX + BDFS_WH_PREFIX_LEN + 1];
+		char *wh_name = bdfs_blend_whiteout_name(name, namlen,
+							  wh_buf,
+							  sizeof(wh_buf));
+		if (!IS_ERR(wh_name)) {
+			unsigned long wh_h = full_name_hash(NULL, wh_name,
+						strlen(wh_name)) & BDFS_DEDUP_MASK;
+			if (test_bit(wh_h, rc->seen))
+				return true; /* whited out; skip */
+		}
+
+		if (bdfs_dedup_test_set(rc, name, namlen))
+			return true; /* duplicate upper entry; skip */
+	} else {
+		/*
+		 * Upper-layer pass: record every name (including whiteout
+		 * names) so the lower pass can detect both duplicates and
+		 * whited-out entries via the dedup bitmap.
+		 */
+		bdfs_dedup_test_set(rc, name, namlen);
+	}
 
 	return dir_emit(rc->caller_ctx, name, namlen, ino, d_type);
 }
@@ -1286,30 +1479,436 @@ static ssize_t bdfs_blend_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	return ret;
 }
 
+/* ── fsync ───────────────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_fsync - Forward fsync to the real backing file.
+ *
+ * For upper-layer (BTRFS) files we open the real file and call its fsync.
+ * For lower-layer (DwarFS) files fsync is a no-op: DwarFS images are
+ * read-only and already fully persisted.
+ *
+ * datasync semantics are preserved: if datasync is set we call ->fsync with
+ * datasync=1 on the real file, which BTRFS maps to fdatawrite + wait.
+ */
+static int bdfs_blend_fsync(struct file *file, loff_t start, loff_t end,
+			    int datasync)
+{
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct file *real_file;
+	int ret;
+
+	/* Lower-layer (DwarFS) files are read-only — nothing to flush. */
+	if (!bi->is_upper)
+		return 0;
+
+	/*
+	 * Use the cached upper_file if available; otherwise open the real
+	 * dentry directly.  We do not cache the file here because fsync may
+	 * be called without a preceding write (e.g. after O_SYNC open).
+	 */
+	if (bi->upper_file) {
+		real_file = bi->upper_file;
+		get_file(real_file);
+	} else {
+		real_file = dentry_open(&bi->real_path, O_RDWR | O_LARGEFILE,
+					current_cred());
+		if (IS_ERR(real_file))
+			return PTR_ERR(real_file);
+	}
+
+	if (real_file->f_op && real_file->f_op->fsync)
+		ret = real_file->f_op->fsync(real_file, start, end, datasync);
+	else
+		ret = generic_file_fsync(real_file, start, end, datasync);
+
+	fput(real_file);
+	return ret;
+}
+
+/* ── mmap ────────────────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_mmap - Map a blend file into the process address space.
+ *
+ * Read-only mappings of lower-layer (DwarFS) files are forwarded directly
+ * to the DwarFS FUSE file's mmap handler.  Write mappings trigger copy-up
+ * first (same as write_iter) and then forward to the BTRFS upper file.
+ *
+ * Kernel version notes:
+ *   - generic_file_mmap() is available on all supported kernels (≥5.15).
+ *   - The vma->vm_file swap pattern is the standard stackable-fs approach
+ *     used by overlayfs since 4.19.
+ */
+static int bdfs_blend_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct inode *inode = file_inode(file);
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct file *real_file;
+	int ret;
+
+	/* Write mapping on a lower-layer inode requires copy-up first. */
+	if (!bi->is_upper && (vma->vm_flags & VM_WRITE)) {
+		ret = bdfs_blend_trigger_copyup(inode, bm);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Open the real backing file for the mapping.  We use the cached
+	 * upper_file for upper-layer inodes to avoid redundant dentry_open
+	 * calls; for lower-layer read-only mappings we open fresh.
+	 */
+	if (bi->is_upper && bi->upper_file) {
+		real_file = bi->upper_file;
+		get_file(real_file);
+	} else {
+		int flags = bi->is_upper ? (O_RDWR | O_LARGEFILE)
+					 : (O_RDONLY | O_LARGEFILE);
+		real_file = dentry_open(&bi->real_path, flags, current_cred());
+		if (IS_ERR(real_file))
+			return PTR_ERR(real_file);
+	}
+
+	if (!real_file->f_op || !real_file->f_op->mmap) {
+		fput(real_file);
+		return -ENODEV;
+	}
+
+	/*
+	 * Swap vm_file to the real file so that page-fault handlers and
+	 * writeback operate on the real inode, not the blend inode.
+	 * This is the same technique used by overlayfs.
+	 *
+	 * vma_set_file() was introduced in 5.17 (commit 3fcd3e4).  On
+	 * 5.15/5.16 we open-code the equivalent.  In both cases real_file
+	 * already holds an extra reference from get_file() / dentry_open()
+	 * above, which becomes the vma's reference.  We do NOT fput() here;
+	 * the VFS releases vma->vm_file when the VMA is destroyed.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+	vma_set_file(vma, real_file);
+	/* vma_set_file() takes its own get_file(); release our ref. */
+	fput(real_file);
+#else
+	/* Manually install real_file as vma->vm_file, consuming our ref. */
+	{
+		struct file *old = vma->vm_file;
+		vma->vm_file = real_file; /* transfers our ref to the vma */
+		if (old)
+			fput(old);
+	}
+#endif
+	ret = vma->vm_file->f_op->mmap(vma->vm_file, vma);
+	return ret;
+}
+
+/* ── xattr set / get ─────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_setxattr - Set an extended attribute on a blend inode.
+ *
+ * Always targets the BTRFS upper layer.  If the inode is currently on a
+ * lower layer, copy-up is triggered first.
+ *
+ * Kernel version notes:
+ *   vfs_setxattr() signature is stable across 5.15–6.15.  The idmap
+ *   parameter was added in 6.0; we use mnt_idmap(bi->real_path.mnt) which
+ *   returns &nop_mnt_idmap on kernels that don't support idmapped mounts.
+ */
+static int bdfs_blend_setxattr(const struct xattr_handler *handler,
+			       struct mnt_idmap *idmap,
+			       struct dentry *dentry, struct inode *inode,
+			       const char *name, const void *value,
+			       size_t size, int flags)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct super_block *sb = inode->i_sb;
+	struct bdfs_blend_mount *bm = sb->s_fs_info;
+	struct mnt_idmap *real_idmap;
+	int ret;
+
+	if (!bi->is_upper) {
+		ret = bdfs_blend_trigger_copyup(inode, bm);
+		if (ret)
+			return ret;
+	}
+
+	real_idmap = mnt_idmap(bi->real_path.mnt);
+	return vfs_setxattr(real_idmap, bi->real_path.dentry, name,
+			    value, size, flags);
+}
+
+/*
+ * bdfs_blend_getxattr - Get an extended attribute from a blend inode.
+ *
+ * Reads from whichever layer currently backs the inode.  For upper-layer
+ * inodes this is the BTRFS file; for lower-layer inodes this is the DwarFS
+ * FUSE file (DwarFS preserves xattrs from the source tree).
+ */
+static int bdfs_blend_getxattr(const struct xattr_handler *handler,
+			       struct dentry *dentry, struct inode *inode,
+			       const char *name, void *value, size_t size)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+
+	if (!bi->real_path.dentry)
+		return -EIO;
+
+	return vfs_getxattr(mnt_idmap(bi->real_path.mnt),
+			    bi->real_path.dentry, name, value, size);
+}
+
+/*
+ * Xattr handler table.  We register a catch-all handler (prefix="") so that
+ * all xattr namespaces (user., trusted., security., system.) are routed
+ * through our set/get implementations.
+ *
+ * Kernel version note: the catch-all empty-prefix handler is supported since
+ * 4.9 (commit 2a7dba391).  On older kernels each namespace needs its own
+ * handler entry — but we target ≥5.15 so this is fine.
+ */
+static const struct xattr_handler bdfs_blend_xattr_handler = {
+	.prefix = "",   /* match all namespaces */
+	.get    = bdfs_blend_getxattr,
+	.set    = bdfs_blend_setxattr,
+};
+
+static const struct xattr_handler * const bdfs_blend_xattr_handlers[] = {
+	&bdfs_blend_xattr_handler,
+	NULL,
+};
+
+/* ── permission ──────────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_permission - Check access permission against the real inode.
+ *
+ * generic_permission() only consults the blend inode's cached uid/gid/mode,
+ * which we keep in sync via bdfs_blend_getattr.  However, POSIX ACLs are
+ * stored as xattrs on the real inode and are not reflected in the blend
+ * inode's i_acl pointer.  We therefore delegate to the real inode's
+ * ->permission handler (or generic_permission if it has none), passing the
+ * real inode's idmap so that idmapped-mount ACL checks work correctly.
+ *
+ * Kernel version notes:
+ *   - inode_permission() is available on all supported kernels.
+ *   - mnt_idmap() returning &nop_mnt_idmap on non-idmapped mounts is
+ *     correct behaviour (no mapping applied).
+ *   - On kernels < 6.0 the idmap parameter to ->permission did not exist;
+ *     we use the preprocessor guard already established in this file.
+ */
+static int bdfs_blend_permission(struct mnt_idmap *idmap,
+				 struct inode *inode, int mask)
+{
+	struct bdfs_blend_inode_info *bi = BDFS_I(inode);
+	struct inode *real;
+	struct mnt_idmap *real_idmap;
+
+	if (!bi->real_path.dentry)
+		return -EIO;
+
+	real = d_inode(bi->real_path.dentry);
+	real_idmap = mnt_idmap(bi->real_path.mnt);
+
+	/*
+	 * Refresh cached credentials from the real inode so that
+	 * generic_permission (called by inode_permission) sees current values.
+	 */
+	inode->i_uid  = real->i_uid;
+	inode->i_gid  = real->i_gid;
+	inode->i_mode = (inode->i_mode & S_IFMT) | (real->i_mode & ~S_IFMT);
+
+	if (real->i_op && real->i_op->permission)
+		return real->i_op->permission(real_idmap, real, mask);
+
+	return generic_permission(real_idmap, real, mask);
+}
+
+/* ── whiteout helpers ────────────────────────────────────────────────────── */
+
+/*
+ * bdfs_blend_whiteout_name - Build the whiteout filename for a given name.
+ *
+ * Writes ".wh.<name>\0" into buf (which must be at least
+ * BDFS_WH_PREFIX_LEN + namelen + 1 bytes).  Returns buf on success or
+ * ERR_PTR(-ENAMETOOLONG) if the result would exceed NAME_MAX.
+ */
+static char *bdfs_blend_whiteout_name(const char *name, size_t namelen,
+				      char *buf, size_t bufsz)
+{
+	if (BDFS_WH_PREFIX_LEN + namelen + 1 > bufsz ||
+	    BDFS_WH_PREFIX_LEN + namelen > NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+
+	memcpy(buf, BDFS_WH_PREFIX, BDFS_WH_PREFIX_LEN);
+	memcpy(buf + BDFS_WH_PREFIX_LEN, name, namelen);
+	buf[BDFS_WH_PREFIX_LEN + namelen] = '\0';
+	return buf;
+}
+
+/*
+ * bdfs_blend_is_whiteout - Return true if dentry is a whiteout marker.
+ *
+ * A whiteout is a zero-length regular file whose name starts with ".wh.".
+ * We check both the name prefix and the file type to avoid false positives
+ * from user files that happen to start with ".wh.".
+ */
+static bool bdfs_blend_is_whiteout(struct dentry *dentry)
+{
+	struct inode *inode;
+
+	if (!dentry || d_is_negative(dentry))
+		return false;
+	if (!str_has_prefix(dentry->d_name.name, BDFS_WH_PREFIX))
+		return false;
+
+	inode = d_inode(dentry);
+	return inode && S_ISREG(inode->i_mode) && inode->i_size == 0;
+}
+
+/*
+ * bdfs_blend_check_whiteout - Check whether the upper layer has whited out
+ * a name that exists on a lower layer.
+ *
+ * Looks up ".wh.<name>" in the upper-layer directory corresponding to
+ * parent_bi.  Returns true if a whiteout exists (lower entry should be
+ * hidden), false otherwise.
+ *
+ * Called from bdfs_blend_lookup and bdfs_blend_iterate_shared.
+ */
+static bool bdfs_blend_check_whiteout(struct bdfs_blend_inode_info *parent_bi,
+				      const char *name, size_t namelen)
+{
+	char wh_buf[NAME_MAX + BDFS_WH_PREFIX_LEN + 1];
+	char *wh_name;
+	struct dentry *parent_dentry;
+	struct dentry *wh_dentry;
+	bool found = false;
+
+	if (!parent_bi->is_upper || !parent_bi->real_path.dentry)
+		return false;
+
+	wh_name = bdfs_blend_whiteout_name(name, namelen,
+					   wh_buf, sizeof(wh_buf));
+	if (IS_ERR(wh_name))
+		return false;
+
+	parent_dentry = parent_bi->real_path.dentry;
+
+	/*
+	 * lookup_one() requires the parent inode lock.  We take it briefly
+	 * here; this is safe because bdfs_blend_check_whiteout is called
+	 * from bdfs_blend_lookup (which holds no inode locks) and from
+	 * bdfs_filldir (which holds the directory file lock, not the inode
+	 * lock).
+	 *
+	 * Kernel version note: lookup_one() signature is stable across
+	 * 5.15–6.15.  lookup_one_unlocked() was removed in 6.4 (it was
+	 * only ever an internal helper); we use lookup_one() throughout.
+	 */
+	inode_lock_shared(d_inode(parent_dentry));
+	wh_dentry = lookup_one(mnt_idmap(parent_bi->real_path.mnt),
+			       wh_name, parent_dentry, strlen(wh_name));
+	inode_unlock_shared(d_inode(parent_dentry));
+
+	if (IS_ERR(wh_dentry))
+		return false;
+
+	found = bdfs_blend_is_whiteout(wh_dentry);
+	dput(wh_dentry);
+	return found;
+}
+
+/*
+ * bdfs_blend_create_whiteout - Create a whiteout marker on the upper layer.
+ *
+ * Creates ".wh.<name>" as a zero-length regular file in the upper-layer
+ * directory.  Called from bdfs_blend_unlink and bdfs_blend_rmdir when the
+ * target exists on a lower layer (so we cannot actually delete it there).
+ *
+ * If the upper-layer directory does not yet exist (the parent is still on
+ * the lower layer), copy-up of the parent directory is triggered first.
+ */
+static int bdfs_blend_create_whiteout(struct inode *dir,
+				      const char *name, size_t namelen,
+				      struct bdfs_blend_mount *bm)
+{
+	struct bdfs_blend_inode_info *parent_bi = BDFS_I(dir);
+	char wh_buf[NAME_MAX + BDFS_WH_PREFIX_LEN + 1];
+	char *wh_name;
+	struct dentry *parent_dentry;
+	struct dentry *wh_dentry;
+	struct mnt_idmap *idmap;
+	int ret;
+
+	/* Ensure the parent directory is on the upper layer. */
+	if (!parent_bi->is_upper) {
+		ret = bdfs_blend_trigger_copyup(dir, bm);
+		if (ret)
+			return ret;
+	}
+
+	wh_name = bdfs_blend_whiteout_name(name, namelen,
+					   wh_buf, sizeof(wh_buf));
+	if (IS_ERR(wh_name))
+		return PTR_ERR(wh_name);
+
+	parent_dentry = parent_bi->real_path.dentry;
+	idmap = mnt_idmap(parent_bi->real_path.mnt);
+
+	inode_lock(d_inode(parent_dentry));
+	wh_dentry = lookup_one(idmap, wh_name, parent_dentry, strlen(wh_name));
+	if (IS_ERR(wh_dentry)) {
+		inode_unlock(d_inode(parent_dentry));
+		return PTR_ERR(wh_dentry);
+	}
+
+	if (d_is_positive(wh_dentry)) {
+		/* Whiteout already exists — nothing to do. */
+		dput(wh_dentry);
+		inode_unlock(d_inode(parent_dentry));
+		return 0;
+	}
+
+	ret = vfs_create(idmap, d_inode(parent_dentry), wh_dentry,
+			 S_IFREG | 0000, false);
+	dput(wh_dentry);
+	inode_unlock(d_inode(parent_dentry));
+	return ret;
+}
+
 /* ── inode_operations / file_operations tables ───────────────────────────── */
 
 static const struct inode_operations bdfs_blend_symlink_iops = {
-	.get_link  = bdfs_blend_get_link,
-	.getattr   = bdfs_blend_getattr,
+	.get_link   = bdfs_blend_get_link,
+	.getattr    = bdfs_blend_getattr,
+	.permission = bdfs_blend_permission,
 };
 
 static const struct inode_operations bdfs_blend_file_iops = {
-	.getattr      = bdfs_blend_getattr,
-	.setattr      = bdfs_blend_setattr,
-	.listxattr    = bdfs_blend_listxattr,
+	.getattr    = bdfs_blend_getattr,
+	.setattr    = bdfs_blend_setattr,
+	.listxattr  = bdfs_blend_listxattr,
+	.permission = bdfs_blend_permission,
 };
 
 static const struct file_operations bdfs_blend_file_fops = {
 	.open       = bdfs_blend_open,
 	.read_iter  = generic_file_read_iter,
 	.write_iter = bdfs_blend_write_iter,
+	.mmap       = bdfs_blend_mmap,
 	.llseek     = generic_file_llseek,
-	.fsync      = generic_file_fsync,
+	.fsync      = bdfs_blend_fsync,
 };
 
 static const struct file_operations bdfs_blend_dir_fops = {
 	.iterate_shared = bdfs_blend_iterate_shared,
 	.llseek         = generic_file_llseek,
+	.fsync          = bdfs_blend_fsync,
 };
 
 static const struct inode_operations bdfs_blend_dir_iops = {
@@ -1317,6 +1916,7 @@ static const struct inode_operations bdfs_blend_dir_iops = {
 	.getattr     = bdfs_blend_getattr,
 	.setattr     = bdfs_blend_setattr,
 	.listxattr   = bdfs_blend_listxattr,
+	.permission  = bdfs_blend_permission,
 	.create      = bdfs_blend_create,
 	.mkdir       = bdfs_blend_mkdir,
 	.unlink      = bdfs_blend_unlink,
@@ -1334,8 +1934,9 @@ static int bdfs_blend_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct inode *root_inode;
 	struct dentry *root_dentry;
 
-	sb->s_magic = BDFS_BLEND_MAGIC;
-	sb->s_op    = &bdfs_blend_sops;
+	sb->s_magic   = BDFS_BLEND_MAGIC;
+	sb->s_op      = &bdfs_blend_sops;
+	sb->s_xattr   = bdfs_blend_xattr_handlers;
 	sb->s_fs_info = bm;
 	bm->sb = sb;   /* back-pointer so bdfs_blend_umount can deactivate_super */
 
@@ -1419,6 +2020,113 @@ int bdfs_blend_mount(void __user *uarg,
 	bdfs_emit_event(BDFS_EVT_BLEND_MOUNTED, arg.btrfs_uuid, 0, event_msg);
 
 	pr_info("bdfs: blend mount queued at %s\n", arg.mount_point);
+	return 0;
+}
+
+/*
+ * bdfs_blend_attach_mounts - Wire daemon-resolved vfsmounts into a blend mount.
+ *
+ * Called via BDFS_IOC_BLEND_ATTACH_MOUNTS after the daemon has mounted the
+ * BTRFS upper layer and all DwarFS lower layers in userspace.  The daemon
+ * passes O_PATH file descriptors; we extract the vfsmount from each fd via
+ * fdget(), take a mntget() reference, and store it in the bdfs_blend_mount.
+ *
+ * Using O_PATH fds is the correct kernel interface for passing vfsmount
+ * references across the userspace/kernel boundary without requiring the
+ * caller to have CAP_SYS_ADMIN for kern_mount().
+ *
+ * Kernel version notes:
+ *   fdget() + real_mount() is stable across 5.15–6.15.
+ *   real_mount() is defined in fs/mount.h (included via mount.h).
+ */
+int bdfs_blend_attach_mounts(void __user *uarg)
+{
+	struct bdfs_ioctl_blend_attach_mounts arg;
+	struct bdfs_blend_mount *bm;
+	struct fd f;
+	struct vfsmount *mnt;
+	bool found = false;
+	u32 i;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	if (arg.n_dwarfs > BDFS_MAX_DWARFS_LAYERS)
+		return -EINVAL;
+
+	/* Find the blend mount by mount_point string. */
+	mutex_lock(&bdfs_blend_mounts_lock);
+	list_for_each_entry(bm, &bdfs_blend_mounts, list) {
+		if (strcmp(bm->mount_point, arg.mount_point) == 0) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&bdfs_blend_mounts_lock);
+
+	if (!found)
+		return -ENOENT;
+
+	/* Attach BTRFS upper-layer mount. */
+	if (arg.btrfs_fd >= 0) {
+		f = fdget(arg.btrfs_fd);
+		if (!f.file)
+			return -EBADF;
+		mnt = mntget(f.file->f_path.mnt);
+		fdput(f);
+
+		/* Drop any previous reference. */
+		if (bm->btrfs_mnt)
+			mntput(bm->btrfs_mnt);
+		bm->btrfs_mnt = mnt;
+	}
+
+	/* Attach DwarFS lower-layer mounts. */
+	for (i = 0; i < arg.n_dwarfs; i++) {
+		struct bdfs_dwarfs_layer *layer;
+
+		if (arg.dwarfs_fds[i] < 0)
+			continue;
+
+		f = fdget(arg.dwarfs_fds[i]);
+		if (!f.file)
+			continue;
+		mnt = mntget(f.file->f_path.mnt);
+		fdput(f);
+
+		/* Find or allocate the layer slot. */
+		layer = NULL;
+		{
+			struct bdfs_dwarfs_layer *l;
+			u32 idx = 0;
+
+			list_for_each_entry(l, &bm->dwarfs_layers, list) {
+				if (idx == i) {
+					layer = l;
+					break;
+				}
+				idx++;
+			}
+		}
+
+		if (!layer) {
+			layer = kzalloc(sizeof(*layer), GFP_KERNEL);
+			if (!layer) {
+				mntput(mnt);
+				return -ENOMEM;
+			}
+			list_add_tail(&layer->list, &bm->dwarfs_layers);
+		} else if (layer->mnt) {
+			mntput(layer->mnt);
+		}
+
+		layer->mnt = mnt;
+	}
+
+	pr_info("bdfs: attached mounts for blend at %s (btrfs=%s, dwarfs_layers=%u)\n",
+		arg.mount_point,
+		bm->btrfs_mnt ? "ok" : "none",
+		arg.n_dwarfs);
 	return 0;
 }
 
