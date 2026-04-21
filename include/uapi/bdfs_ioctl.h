@@ -158,6 +158,12 @@ struct bdfs_ioctl_export_to_dwarfs {
 	__u32 flags;
 #define BDFS_EXPORT_INCREMENTAL (1 << 0) /* incremental from parent snap */
 #define BDFS_EXPORT_VERIFY      (1 << 1) /* verify image after creation */
+	/*
+	 * Absolute path to the parent read-only snapshot for incremental
+	 * export (btrfs send -p <parent>).  Required when
+	 * BDFS_EXPORT_INCREMENTAL is set; ignored otherwise.
+	 */
+	char  parent_snap_path[BDFS_PATH_MAX];
 	__u64 image_id_out;              /* out: assigned image id */
 };
 #define BDFS_IOC_EXPORT_TO_DWARFS \

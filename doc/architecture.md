@@ -328,7 +328,9 @@ and the BTRFS upper layer as `SCRATCH_DEV`.
 | `generic/099` | `O_DIRECT` read (forwarded to upper) |
 | `generic/112` | Whiteout / opaque directory (overlayfs-style) |
 | `generic/117` | `readdir` correctness |
+| `generic/263` | `copy_file_range` (fast path via BTRFS reflink when both files are upper-layer) |
 | `generic/285` | `fallocate` (forwarded to upper) |
+| `generic/388` | `FS_IOC_GETFLAGS` / `FS_IOC_SETFLAGS` (forwarded to real inode) |
 
 ### Expected to fail / not applicable
 
@@ -338,8 +340,6 @@ and the BTRFS upper layer as `SCRATCH_DEV`.
 | `generic/010` | `atime` update on lower layer — DwarFS FUSE does not update atime |
 | `generic/035` | Filesystem-specific ioctl — blend ioctls are on `/dev/bdfs_ctl`, not the mount |
 | `generic/091` | `reflink` — BTRFS reflink not exposed through blend layer |
-| `generic/263` | `copy_file_range` — not yet implemented in blend `file_operations` |
-| `generic/388` | `FS_IOC_GETFLAGS` — not forwarded through blend inode |
 
 Run xfstests against the blend layer:
 
@@ -367,8 +367,8 @@ export SCRATCH_MNT=/mnt/scratch
 | Whiteout support | ✅ Complete — `.wh.<name>` markers on unlink/rmdir of lower entries |
 | vfsmount reference safety | ✅ Complete — `BDFS_IOC_BLEND_ATTACH_MOUNTS` + `mntget`/`mntput` |
 | statfs aggregation | ✅ Complete — BTRFS upper + DwarFS layer sizes |
-| Incremental export | ⚠️ Pending — `--incremental` flag accepted but `btrfs send -p` not wired |
-| Read-only import flag | ⚠️ Pending — `--readonly` constructs the call but does not execute it |
-| `copy_file_range` | ⚠️ Pending — not in blend `file_operations` |
-| `FS_IOC_GETFLAGS` | ⚠️ Pending — not forwarded through blend inode |
+| `copy_file_range` | ✅ Complete — fast path via `vfs_copy_file_range` (BTRFS reflink); slow path via `generic_copy_file_range` when source is lower-layer |
+| `FS_IOC_GETFLAGS` / `FS_IOC_SETFLAGS` | ✅ Complete — forwarded to real inode's `->unlocked_ioctl`; set triggers copy-up on lower inodes |
+| Incremental export (`--incremental`) | ✅ Complete — `--parent-snap <path>` flag wired through CLI → ioctl struct → netlink event → daemon job → `btrfs send -p` |
+| Read-only import (`--readonly`) | ✅ Complete — `btrfs property set -ts <subvol> ro true` executed in daemon job handler |
 | `O_DIRECT` write on lower | ✗ Not applicable — lower layer is always read-only |

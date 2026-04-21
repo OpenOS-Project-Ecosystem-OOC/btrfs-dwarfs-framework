@@ -6,7 +6,7 @@
  *               --btrfs-mount <path> --name <image-name>
  *               [--compression zstd|lzma|lz4|brotli|none]
  *               [--block-size-bits <n>]  [--workers <n>]
- *               [--incremental]  [--verify]
+ *               [--incremental --parent-snap <path>]  [--verify]
  *
  *   bdfs import --partition <uuid> --image-id <id>
  *               --btrfs-mount <path> --subvol-name <name>
@@ -40,6 +40,7 @@ int cmd_export(struct bdfs_cli *cli, int argc, char *argv[])
 		{ "block-size-bits",required_argument, NULL, 'B' },
 		{ "workers",        required_argument, NULL, 'w' },
 		{ "incremental",    no_argument,       NULL, 'i' },
+		{ "parent-snap",    required_argument, NULL, 'P' },
 		{ "verify",         no_argument,       NULL, 'V' },
 		{ "help",           no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
@@ -50,7 +51,7 @@ int cmd_export(struct bdfs_cli *cli, int argc, char *argv[])
 	arg.block_size_bits = 22;
 	arg.worker_threads  = 4;
 
-	while ((opt = getopt_long(argc, argv, "p:S:b:n:c:B:w:iVh",
+	while ((opt = getopt_long(argc, argv, "p:S:b:n:c:B:w:iP:Vh",
 				  opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p':
@@ -60,12 +61,13 @@ int cmd_export(struct bdfs_cli *cli, int argc, char *argv[])
 			}
 			break;
 		case 'S': arg.btrfs_subvol_id = (uint64_t)strtoull(optarg, NULL, 0); break;
-		case 'b': strncpy(arg.btrfs_mount, optarg, sizeof(arg.btrfs_mount) - 1); break;
-		case 'n': strncpy(arg.image_name,  optarg, sizeof(arg.image_name)  - 1); break;
+		case 'b': strncpy(arg.btrfs_mount,      optarg, sizeof(arg.btrfs_mount)      - 1); break;
+		case 'n': strncpy(arg.image_name,        optarg, sizeof(arg.image_name)        - 1); break;
 		case 'c': arg.compression     = bdfs_compression_from_name(optarg); break;
 		case 'B': arg.block_size_bits  = (uint32_t)atoi(optarg); break;
 		case 'w': arg.worker_threads   = (uint32_t)atoi(optarg); break;
 		case 'i': arg.flags |= BDFS_EXPORT_INCREMENTAL; break;
+		case 'P': strncpy(arg.parent_snap_path, optarg, sizeof(arg.parent_snap_path) - 1); break;
 		case 'V': arg.flags |= BDFS_EXPORT_VERIFY;      break;
 		case 'h':
 			printf("Usage: bdfs export --partition <uuid> "
@@ -73,7 +75,7 @@ int cmd_export(struct bdfs_cli *cli, int argc, char *argv[])
 			       "--name <image-name>\n"
 			       "  [--compression zstd|lzma|lz4|brotli|none]\n"
 			       "  [--block-size-bits <n>]  [--workers <n>]\n"
-			       "  [--incremental]  [--verify]\n");
+			       "  [--incremental --parent-snap <path>]  [--verify]\n");
 			return 0;
 		default: return 1;
 		}
@@ -81,6 +83,10 @@ int cmd_export(struct bdfs_cli *cli, int argc, char *argv[])
 
 	if (!arg.image_name[0])   { bdfs_err("--name is required");        return 1; }
 	if (!arg.btrfs_mount[0])  { bdfs_err("--btrfs-mount is required"); return 1; }
+	if ((arg.flags & BDFS_EXPORT_INCREMENTAL) && !arg.parent_snap_path[0]) {
+		bdfs_err("--incremental requires --parent-snap <path>");
+		return 1;
+	}
 
 	ret = bdfs_cli_open_ctl(cli);
 	if (ret) return 1;
