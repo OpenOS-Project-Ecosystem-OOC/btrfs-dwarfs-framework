@@ -4,6 +4,63 @@ A hybrid filesystem framework that blends [BTRFS](https://github.com/kdave/btrfs
 
 ---
 
+## What's New
+
+### Userspace blend fallback (fuse-overlayfs)
+When the `bdfs_blend` kernel module is unavailable (e.g. on a stock kernel), the blend layer now falls back automatically to [fuse-overlayfs](https://github.com/containers/fuse-overlayfs). Pass `--userspace` to `bdfs blend mount` to force this path, or set `userspace_fallback = true` in `bdfs.conf`. The daemon detects `ENODEV` on the ioctl and retries via `BDFS_JOB_MOUNT_BLEND_USERSPACE`.
+
+### O(1) mount table lookup
+The mount table previously used a linear TAILQ scan for every umount and lookup. It now maintains a parallel FNV-1a open-addressing hash index (`bdfs_mount_index`, 256 slots, linear probing with tombstones) in `userspace/daemon/bdfs_mount_table.c`, giving O(1) lookup by mount point path.
+
+### Snapshot pruning (`bdfs snapshot prune`)
+```bash
+bdfs snapshot prune /mnt/btrfs/subvol \
+    --keep 5 \
+    --pattern "backup_*" \
+    --demote-first \
+    --dry-run
+```
+Sorts snapshots by mtime, keeps the N most recent, and deletes the rest. `--demote-first` archives each pruned snapshot as a DwarFS image before deletion. `--dry-run` reports what would be deleted without acting.
+
+### Home directory snapshots (`bdfs home`)
+Per-user snapshot management with [ecryptfs](https://www.ecryptfs.org/) support:
+```bash
+bdfs home init /home/alice        # set up snapshot tracking for a home dir
+bdfs home snapshot /home/alice    # take a snapshot
+bdfs home demote /home/alice      # compress oldest snapshots to DwarFS
+```
+User configuration is read from `~/.config/bdfs/bdfs.conf`.
+
+### Maintenance operations
+Weekly scrub and monthly balance are now managed by systemd units installed via `bdfs setup` or `boot/install.sh --maintenance`:
+
+| Unit | Schedule | Notes |
+|---|---|---|
+| `bdfs-scrub.timer` | Weekly | Reads device list from `/etc/bdfs/scrub.conf` |
+| `bdfs-balance.timer` | Monthly | Skips if a balance is already running |
+
+### Distro-agnostic setup
+All distro-specific assumptions have been removed. `bdfs setup fstab` generates `/etc/fstab` entries by introspecting `btrfs subvolume list` output at runtime — no hardcoded paths, package managers, usernames, or desktop environments. See [`doc/distro-agnostic.md`](doc/distro-agnostic.md) for the full policy and [`doc/bootloader-integration.md`](doc/bootloader-integration.md) for GRUB2/systemd-boot/Limine setup.
+
+### Full socket command dispatch
+`userspace/daemon/bdfs_socket.c` now implements all commands used by the CLI and GUI clients:
+
+| Command | Action |
+|---|---|
+| `list_partitions` | Walks `/proc/mounts` for btrfs entries |
+| `list_images` | Scans archive dir for `.dwarfs` files |
+| `list_mounts` | Returns tracked blend mount points |
+| `blend_mount` | Enqueues kernel or userspace blend mount job |
+| `umount` | Enqueues umount job |
+| `mount` | Enqueues bare DwarFS mount job |
+| `import` | Enqueues `BDFS_JOB_IMPORT_FROM_DWARFS` |
+| `demote` | Enqueues `BDFS_JOB_EXPORT_TO_DWARFS` |
+| `prune` | Enqueues `BDFS_JOB_PRUNE` |
+| `status` | Returns worker count, queue depth, active mounts |
+| `ping` | Liveness check |
+
+---
+
 ## Concept
 
 Two technologies, two strengths:
@@ -53,7 +110,7 @@ Merges a BTRFS upper layer and one or more DwarFS lower layers into a single coh
 btrfs-dwarfs-framework/
 ├── include/
 │   ├── btrfs_dwarfs/types.h      # Shared type definitions
-│   └── uapi/bdfs_ioctl.h         # Kernel↔userspace ioctl interface (18 ioctls)
+│   └── uapi/bdfs_ioctl.h         # Kernel↔userspace ioctl interface
 │
 ├── kernel/
 │   └── btrfs_dwarfs/
@@ -62,48 +119,62 @@ btrfs-dwarfs-framework/
 │       ├── bdfs_btrfs_part.c     # BTRFS-backed partition backend
 │       ├── bdfs_dwarfs_part.c    # DwarFS-backed partition backend
 │       ├── bdfs_internal.h       # Internal kernel declarations
-│       ├── Kbuild                # Kernel build rules
-│       └── Kconfig               # Kernel config options
+│       ├── Kbuild
+│       └── Kconfig
 │
 ├── userspace/
 │   ├── daemon/
 │   │   ├── bdfs_daemon.c         # Lifecycle, worker pool, main loop
-│   │   ├── bdfs_exec.c           # mkdwarfs/dwarfs/btrfs tool wrappers
-│   │   ├── bdfs_jobs.c           # Job handlers (export/import/mount/snapshot)
+│   │   ├── bdfs_exec.c           # mkdwarfs/dwarfs/btrfs/fuse-overlayfs wrappers
+│   │   ├── bdfs_jobs.c           # Job handlers (export/import/mount/prune/userspace-blend)
+│   │   ├── bdfs_mount_table.c    # FNV-1a hash index for O(1) mount lookups
 │   │   ├── bdfs_netlink.c        # Netlink event listener
-│   │   └── bdfs_socket.c         # Unix socket server for CLI
+│   │   └── bdfs_socket.c         # Unix socket server — full command dispatch
 │   ├── cli/
-│   │   ├── bdfs_main.c           # Entry point, global options, dispatch
+│   │   ├── bdfs_main.c           # Entry point, dispatch table
 │   │   ├── bdfs_partition.c      # partition add/remove/list/show
 │   │   ├── bdfs_export_import.c  # export, import
-│   │   ├── bdfs_mount.c          # mount, umount, blend mount/umount
-│   │   ├── bdfs_snapshot_promote_demote.c  # snapshot, promote, demote
+│   │   ├── bdfs_mount.c          # mount, umount, blend mount/umount (--userspace)
+│   │   ├── bdfs_snapshot_promote_demote.c  # snapshot, promote, demote, prune
+│   │   ├── bdfs_home.c           # home init/snapshot/demote
+│   │   ├── bdfs_setup.c          # setup fstab/check
+│   │   ├── bdfs_userconf.c/.h    # ~/.config/bdfs/bdfs.conf parser
 │   │   └── bdfs_status.c         # status
 │   └── CMakeLists.txt
 │
+├── configs/
+│   ├── bdfs.conf                 # Framework configuration
+│   ├── bdfs_daemon.service       # systemd daemon unit
+│   ├── bdfs-scrub.{sh,service,timer}    # Weekly scrub
+│   └── bdfs-balance.{sh,service,timer}  # Monthly balance
+│
+├── tools/
+│   ├── homed/                    # systemd-homed identity repair (distro-agnostic)
+│   └── setup/
+│       └── bdfs-genfstab.sh      # Runtime fstab generator
+│
+├── boot/
+│   └── install.sh                # Installer (--maintenance, --homed-check flags)
+│
 ├── tests/
 │   ├── integration/              # Loopback-device test suites (requires root)
-│   │   ├── lib.sh                # Shared helpers, loopback setup, assertions
+│   │   ├── lib.sh
 │   │   ├── test_dwarfs_partition.sh
 │   │   ├── test_btrfs_partition.sh
-│   │   ├── test_blend_layer.sh
+│   │   ├── test_blend_layer.sh   # Includes userspace blend (fuse-overlayfs) tests
 │   │   ├── test_snapshot_lifecycle.sh
 │   │   └── run_all.sh
-│   └── unit/                     # Unit tests (no root required)
+│   └── unit/
 │       ├── test_uuid.c
 │       ├── test_compression.c
 │       └── test_job_alloc.c
 │
-├── configs/
-│   ├── bdfs.conf                 # Framework configuration
-│   └── bdfs_daemon.service       # systemd service unit
-│
-├── doc/
-│   ├── architecture.md           # Detailed architecture and data flow diagrams
-│   ├── bdfs.1                    # CLI man page
-│   └── bdfs_daemon.8             # Daemon man page
-│
-└── Makefile                      # Top-level build (kernel + userspace)
+└── doc/
+    ├── architecture.md
+    ├── bootloader-integration.md # GRUB2 / systemd-boot / Limine
+    ├── distro-agnostic.md        # Policy: no hardcoded distro assumptions
+    ├── bdfs.1
+    └── bdfs_daemon.8
 ```
 
 ---
@@ -120,6 +191,7 @@ btrfs-dwarfs-framework/
 | `dwarfs` (FUSE3) | DwarFS image mounting |
 | `dwarfsextract` | DwarFS image extraction |
 | `dwarfsck` | DwarFS image verification |
+| `fuse-overlayfs` | Userspace blend fallback (optional) |
 | CMake ≥ 3.16 | Userspace build |
 | pthreads | Daemon worker pool |
 
@@ -236,11 +308,18 @@ bdfs snapshot \
 ### 7. Mount the blend namespace
 
 ```bash
+# Kernel blend (requires bdfs_blend module)
+bdfs blend mount \
+    --btrfs-uuid <uuid> \
+    --dwarfs-uuid <uuid> \
+    --mountpoint /mnt/blend
+
+# Userspace blend via fuse-overlayfs (no kernel module needed)
 bdfs blend mount \
     --btrfs-uuid <uuid> \
     --dwarfs-uuid <uuid> \
     --mountpoint /mnt/blend \
-    --writeback
+    --userspace
 ```
 
 ### 8. Promote / demote
@@ -259,11 +338,41 @@ bdfs demote \
     --delete-subvol
 ```
 
+### 9. Prune snapshots
+
+```bash
+# Keep 5 most recent, archive older ones as DwarFS before deleting
+bdfs snapshot prune /mnt/data --keep 5 --demote-first
+
+# Preview without making changes
+bdfs snapshot prune /mnt/data --keep 5 --dry-run
+```
+
+### 10. Home directory snapshots
+
+```bash
+bdfs home init /home/alice
+bdfs home snapshot /home/alice
+bdfs home demote /home/alice
+```
+
+### 11. Distro-agnostic setup
+
+```bash
+# Generate /etc/fstab from live btrfs subvolume introspection
+bdfs setup fstab
+
+# Verify setup health
+bdfs setup check
+
+# Install weekly scrub + monthly balance timers
+sudo bash boot/install.sh --maintenance
+```
+
 ### Status
 
 ```bash
 bdfs status
-bdfs status --partition <uuid>
 bdfs status --json
 ```
 
@@ -284,8 +393,8 @@ sudo bash tests/integration/run_all.sh
 Suites:
 - `test_dwarfs_partition.sh` — export pipeline, compression ratio, FUSE mount, integrity, read-only enforcement
 - `test_btrfs_partition.sh` — image storage, CoW semantics, snapshot independence, import pipeline, scrub
-- `test_blend_layer.sh` — read routing, copy-up on write, promote/demote, round-trip integrity
-- `test_snapshot_lifecycle.sh` — incremental snapshot chains, independent image mounts, size progression
+- `test_blend_layer.sh` — kernel blend, userspace blend (fuse-overlayfs), copy-up on write, promote/demote, round-trip integrity
+- `test_snapshot_lifecycle.sh` — incremental snapshot chains, prune with demote-first, size progression
 
 ### Unit tests (no root required)
 
@@ -310,7 +419,7 @@ man doc/bdfs_daemon.8
 
 ## Known Limitations
 
-- **Blend layer lookup is a skeleton.** The `bdfs_blend` VFS type is registered and the blend mount/umount ioctls are wired, but full inode routing across the BTRFS/DwarFS boundary in `bdfs_blend_lookup` requires kernel-version-specific FUSE internal API work and is not yet complete.
+- **Blend layer inode routing is a skeleton.** The `bdfs_blend` VFS type is registered and blend mount/umount ioctls are wired, but full inode routing across the BTRFS/DwarFS boundary in `bdfs_blend_lookup` requires kernel-version-specific FUSE internal API work and is not yet complete. Use `--userspace` (fuse-overlayfs) for a fully functional blend layer today.
 - **Incremental export not wired.** The `--incremental` flag is accepted but `btrfs send -p <parent>` is not yet passed through in the daemon job handler.
 - **Read-only import is stubbed.** The `--readonly` flag on `bdfs import` constructs the `btrfs property set ro true` call but does not execute it yet.
 
@@ -324,3 +433,4 @@ GPL-2.0-or-later. See individual file headers.
 
 - [kdave/btrfs-devel](https://github.com/kdave/btrfs-devel) — BTRFS kernel development tree
 - [mhx/dwarfs](https://github.com/mhx/dwarfs) — DwarFS compressed filesystem
+- [containers/fuse-overlayfs](https://github.com/containers/fuse-overlayfs) — Userspace overlay filesystem (blend fallback)
