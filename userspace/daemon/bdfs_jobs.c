@@ -652,6 +652,158 @@ int bdfs_job_prune(struct bdfs_daemon *d, struct bdfs_job *job)
 	return ret;
 }
 
+/* ── Autosnap rollback ───────────────────────────────────────────────────── */
+
+/*
+ * bdfs_job_autosnap_rollback - Roll back the root btrfs subvolume (@) to a
+ * named autosnap snapshot.
+ *
+ * Steps:
+ *   1. Mount the top-level btrfs volume (subvolid=5) at a private tmpdir.
+ *   2. Verify the named autosnap-* subvolume exists under the mount.
+ *   3. Rename the current @ to @autosnap-rollback-backup-<timestamp> so the
+ *      rollback is itself recoverable.
+ *   4. Create a new writable snapshot of the autosnap subvolume as the new @.
+ *   5. Unmount the top-level volume and remove the tmpdir.
+ *
+ * The caller must reboot for the new @ to take effect.
+ *
+ * Failure modes:
+ *   - Snapshot not found          → ENOENT, no changes made.
+ *   - Rename fails                → EBUSY or EIO, no changes made.
+ *   - Snapshot creation fails     → attempts to rename @ back; logs error.
+ *   - Unmount fails               → logged; mount will be cleaned up on reboot.
+ */
+int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job)
+{
+	const struct bdfs_job *j = job;
+	const char *btrfs_mount  = j->autosnap_rollback.btrfs_mount;
+	const char *snap_name    = j->autosnap_rollback.snapshot_name;
+
+	char  tmpdir[BDFS_PATH_MAX];
+	char  snap_path[BDFS_PATH_MAX];
+	char  current_at[BDFS_PATH_MAX];
+	char  backup_at[BDFS_PATH_MAX];
+	char  new_at[BDFS_PATH_MAX];
+	char  dev[BDFS_PATH_MAX];
+	time_t now;
+	struct tm tm_now;
+	char  ts[32];
+	int   ret = 0;
+
+	/* Validate snapshot name starts with "autosnap-" */
+	if (strncmp(snap_name, "autosnap-", 9) != 0) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: '%s' is not an autosnap snapshot",
+		       snap_name);
+		return -EINVAL;
+	}
+
+	/* Step 1: mount top-level btrfs volume (subvolid=5) */
+	snprintf(tmpdir, sizeof(tmpdir),
+		 "%s/.bdfs_rollback_XXXXXX", d->cfg.state_dir);
+	if (!mkdtemp(tmpdir)) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: mkdtemp failed: %m");
+		return -errno;
+	}
+
+	/* Resolve the block device backing btrfs_mount */
+	{
+		FILE *fp;
+		char  cmd[BDFS_PATH_MAX + 64];
+		snprintf(cmd, sizeof(cmd),
+			 "findmnt -no SOURCE '%s' 2>/dev/null", btrfs_mount);
+		fp = popen(cmd, "r");
+		if (!fp || !fgets(dev, sizeof(dev), fp)) {
+			syslog(LOG_ERR,
+			       "bdfs: autosnap_rollback: cannot resolve device for %s",
+			       btrfs_mount);
+			if (fp) pclose(fp);
+			rmdir(tmpdir);
+			return -ENODEV;
+		}
+		pclose(fp);
+		/* Strip trailing newline */
+		dev[strcspn(dev, "\n")] = '\0';
+	}
+
+	if (mount(dev, tmpdir, "btrfs", MS_RDONLY,
+		  "subvolid=5") < 0) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: mount subvolid=5 %s → %s: %m",
+		       dev, tmpdir);
+		rmdir(tmpdir);
+		return -errno;
+	}
+
+	/* Step 2: verify the snapshot exists */
+	snprintf(snap_path,   sizeof(snap_path),   "%s/%s",  tmpdir, snap_name);
+	snprintf(current_at,  sizeof(current_at),  "%s/@",   tmpdir);
+
+	{
+		struct stat st;
+		if (stat(snap_path, &st) < 0) {
+			syslog(LOG_ERR,
+			       "bdfs: autosnap_rollback: snapshot not found: %s",
+			       snap_path);
+			ret = -ENOENT;
+			goto out_umount;
+		}
+	}
+
+	/* Step 3: rename @ → @autosnap-rollback-backup-<timestamp> */
+	time(&now);
+	gmtime_r(&now, &tm_now);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
+	snprintf(backup_at, sizeof(backup_at),
+		 "%s/@autosnap-rollback-backup-%s", tmpdir, ts);
+
+	if (rename(current_at, backup_at) < 0) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: rename @ → %s: %m",
+		       backup_at);
+		ret = -errno;
+		goto out_umount;
+	}
+
+	syslog(LOG_INFO,
+	       "bdfs: autosnap_rollback: current @ saved as %s",
+	       backup_at);
+
+	/* Step 4: create writable snapshot of autosnap subvol as new @ */
+	snprintf(new_at, sizeof(new_at), "%s/@", tmpdir);
+
+	ret = bdfs_exec_btrfs_snapshot(d, snap_path, new_at,
+				       false /* writable */);
+	if (ret) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: snapshot %s → @ failed: %d",
+		       snap_name, ret);
+		/* Attempt to restore the backup */
+		if (rename(backup_at, current_at) < 0)
+			syslog(LOG_ERR,
+			       "bdfs: autosnap_rollback: CRITICAL: "
+			       "failed to restore backup @ from %s: %m",
+			       backup_at);
+		goto out_umount;
+	}
+
+	syslog(LOG_INFO,
+	       "bdfs: autosnap_rollback: rolled back to '%s'; "
+	       "reboot required to activate new @",
+	       snap_name);
+
+out_umount:
+	/* Step 5: unmount and clean up tmpdir */
+	if (umount2(tmpdir, MNT_DETACH) < 0)
+		syslog(LOG_WARNING,
+		       "bdfs: autosnap_rollback: umount %s: %m (will clean on reboot)",
+		       tmpdir);
+	rmdir(tmpdir);
+	return ret;
+}
+
 /* ── Mount blend layer — userspace fuse-overlayfs fallback ──────────────── */
 
 /*

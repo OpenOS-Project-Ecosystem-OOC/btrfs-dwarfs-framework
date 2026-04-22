@@ -66,6 +66,16 @@ enum bdfs_job_type {
 	 * Optionally demotes pruned snapshots to DwarFS before deleting.
 	 */
 	BDFS_JOB_PRUNE,
+	/*
+	 * Roll back to an autosnap snapshot:
+	 *   1. Mount the top-level btrfs volume (subvolid=5).
+	 *   2. Rename the current @ subvolume to @autosnap-rollback-backup-<ts>.
+	 *   3. Create a new writable snapshot of the named autosnap subvolume
+	 *      as the new @.
+	 *   4. Unmount the top-level volume.
+	 * A reboot is required for the new @ to take effect.
+	 */
+	BDFS_JOB_AUTOSNAP_ROLLBACK,
 };
 
 /* A unit of work dispatched to the thread pool */
@@ -192,6 +202,21 @@ struct bdfs_job {
 #define BDFS_PRUNE_DRY_RUN      (1 << 1) /* log but do not delete */
 			uint32_t demote_compression;
 		} prune;
+
+		/*
+		 * autosnap_rollback: roll back the root btrfs subvolume (@)
+		 * to a named autosnap snapshot.
+		 *
+		 * btrfs_mount    - top-level btrfs mountpoint (subvolid=5)
+		 * snapshot_name  - name of the autosnap-* subvolume to restore
+		 *
+		 * The current @ is preserved as @autosnap-rollback-backup-<ts>
+		 * so the rollback itself is recoverable.
+		 */
+		struct {
+			char btrfs_mount[BDFS_PATH_MAX];
+			char snapshot_name[BDFS_NAME_MAX + 1];
+		} autosnap_rollback;
 	};
 
 	/* Completion callback (called from worker thread) */
@@ -317,6 +342,7 @@ int bdfs_job_umount_blend(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_mount_blend_userspace(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_prune(struct bdfs_daemon *d, struct bdfs_job *job);
+int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job);
 
 /* mount table helpers */
 void bdfs_mount_track(struct bdfs_daemon *d, enum bdfs_mount_type type,
