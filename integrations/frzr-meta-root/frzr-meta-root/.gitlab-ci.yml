@@ -1,0 +1,29 @@
+default:
+  image: golang:1.25
+
+variables:
+  GOPATH: "$CI_PROJECT_DIR/.go"
+  GOFLAGS: "-mod=mod"
+
+cache:
+  paths:
+    - .go/pkg/mod/
+
+stages:
+  - verify
+
+# Ensure the module graph resolves and all packages compile.
+build:
+  stage: verify
+  script:
+    - cd frzr-meta-root
+    - go mod download
+    - go build ./...
+
+# Static analysis — catches type errors, unused variables, unreachable code.
+vet:
+  stage: verify
+  script:
+    - cd frzr-meta-root
+    - go mod download
+    - go vet ./...

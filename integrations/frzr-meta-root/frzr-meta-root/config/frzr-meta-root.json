@@ -1,0 +1,38 @@
+{
+    "_comment": "frzr-meta-root example config. Copy to /etc/frzr-meta-root/frzr-meta-root.json",
+
+    "incusSocket": "/var/lib/incus/unix.socket",
+    "incusRemote": "oci-registry",
+    "incusStoragePool": "default",
+
+    "name": "myorg/myos",
+    "tag": "stable",
+    "maxParallelDownloads": 2,
+
+    "deployMode": "ab",
+
+    "partLabelA": "fmr-a",
+    "partLabelB": "fmr-b",
+    "partLabelVar": "fmr-var",
+    "partLabelBoot": "fmr-boot",
+    "partLabelEfi": "fmr-efi",
+    "partCryptVar": "",
+
+    "thinProvisioning": false,
+    "thinInitVolume": "",
+
+    "btrfsMountLabel": "frzr_root",
+    "btrfsEfiLabel": "frzr_efi",
+
+    "iPkgMngPre": "",
+    "iPkgMngPost": "",
+    "iPkgMngAdd": "apt install -y",
+    "iPkgMngRm": "apt remove -y",
+    "iPkgMngApi": "",
+    "iPkgMngStatus": 0,
+
+    "updateInitramfsCmd": "/usr/sbin/update-initramfs -u",
+    "updateGrubCmd": "/usr/sbin/grub-mkconfig -o '%s'",
+
+    "differURL": ""
+}

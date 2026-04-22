@@ -1,0 +1,10 @@
+[Unit]
+Description=frzr-meta-root automatic update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/frzr-meta-root upgrade --check
+# If an update is available, stage it (non-interactive, no reboot).
+ExecStartPost=/bin/sh -c 'frzr-meta-root upgrade || true'
