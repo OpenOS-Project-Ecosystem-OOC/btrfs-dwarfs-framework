@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+# Define the base command with common options
+command="pkexec btrfs-assistant"
+
+# Add xdg-desktop option if XDG_CURRENT_DESKTOP is set
+if [[ -n ${XDG_CURRENT_DESKTOP} ]]; then
+    command="${command} --xdg-desktop=\"${XDG_CURRENT_DESKTOP}\""
+fi
+
+# Add platform and display options when using Wayland
+if [[ -n "${WAYLAND_DISPLAY}" ]]; then
+    command="${command} --display=\"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\""
+    if [[ -n "${QT_QPA_PLATFORM}" ]]; then
+        command="${command} --platform=\"${QT_QPA_PLATFORM}\""
+    fi
+else
+    # only needed for X session
+    command="${command} --xdg-runtime=\"${XDG_RUNTIME_DIR}\""
+fi
+
+# Add platformtheme option if QT_QPA_PLATFORMTHEME is set
+if [[ -n ${QT_QPA_PLATFORMTHEME} ]]; then
+    command="${command} --platformtheme=\"${QT_QPA_PLATFORMTHEME}\""
+fi
+
+# Add style-override option if QT_STYLE_OVERRIDE is set
+if [[ -n ${QT_STYLE_OVERRIDE} ]]; then
+    command="${command} --style-override=\"${QT_STYLE_OVERRIDE}\""
+fi
+
+# Execute the constructed command
+eval "$command"

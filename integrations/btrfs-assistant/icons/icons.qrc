@@ -1,0 +1,15 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file>edit-clear.svg</file>
+        <file>checkmark.svg</file>
+        <file>cancel.svg</file>
+        <file>plus.svg</file>
+        <file>minus.svg</file>
+        <file>folder.svg</file>
+        <file>reload.svg</file>
+        <file>reset.svg</file>
+        <file>restore.svg</file>
+        <file>save.svg</file>
+        <file>btrfs-assistant.svg</file>
+    </qresource>
+</RCC>

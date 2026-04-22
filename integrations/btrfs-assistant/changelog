@@ -1,0 +1,158 @@
+### Btrfs Assistant
+
+2.2 - 2025-06-15
+* Fix overwriting permissions on xdg-runtime-dir(Contributed by Luan Vitor Simião Oliveira)
+* Fix free space percentage calculations
+* Fix a regression that blocked restoring when booted from an ISO
+* Replace the mount library call with the mount command to avoid corrupting lsblk output
+* Fix issues when DISPLAY is not set(Contributed by Austin Horstman)
+
+
+2.1.1 - 2024-05-11
+* Fix btrfs-assistant script regression impacting wlroots
+
+2.1 - 2024-05-11
+* Improve Wayland support(Contributed by Integral)
+* Set proper icon when running under Wayland
+* Add support for CLI to run in TTY(Contributed by Integral)
+* Add minimum free size to the information section(Contributed by Nikolas Koesling)
+* When creating snapshots, use errors from btrfs library
+* Add support for Qt 6.4 on Debian
+* Fix an issue where Btrfs Assistant was breaking flatpaks on Fedora
+
+2.0 - 2024-03-10
+* Ported to Qt 6
+* Added percentage value display for filesystem utilization(Contributed by Nikolas Koesling)
+* CLI snapshots are now restored via an index to make the process more user friendly
+* Changed timestamp on subvol backups to UTC and ISO format
+
+
+1.9 - 2024-01-14
+* Improve CSV parsing(Contributed by HoroTW)
+* Added the ability to modify Snapper snapshot descriptions(Contributed by HoroTW)
+* Added support for QT_STYLE_OVERRIDE(Contributed by BluishHumility)
+
+
+1.8 - 2023-02-11
+* Add support for handling snapshots of the root of the btrfs partition
+* Add the ability to autodetect the subvolume mounted at /.snapshots
+* Display the cleanup algorithm on the list of Snapper snapshots
+* Add a context menu to the Snapper page
+* Add the ability to change the cleanup algorithm of Snapper snapshots
+* Fix an issue with the default config file using the wrong format
+* Added tooltip about how timeline snapshots work to snapper config settings
+
+1.7 - 2023-01-07
+* Added the ability to directly browse files in a subvolume from the subvolumes tab(Contributed by Austin Horstman)
+* Btrfs Assistant backups can now be restored from the context menu on the subvolumes tab(Contributed by Austin Horstman)
+* Support for Hyprland has been added(Contributed by Austin Horstman)
+* Yet another fix for Sway support(Contributed by Austin Horstman)
+* Fix displayed sizes for volumes larger than 2TB(Contributed by Arthur Bols)
+* Fix nothing selected when using the keyboard to select all
+* The browse/restore buttons on the subvolumes tab are now disabled instead of being hidden
+
+1.6.3 - 2022-08-24
+* Fix a bug that caused theming to not work and broke sway support
+
+1.6.2 - 2022-08-21
+* Change the launcher script to handle sway
+* Added an AppStream metainfo file(Contributed by Arthur Bols)
+* Fix a bug when the snapshot subvolume is directly attached to the root partition
+
+1.6.1 - 2022-06-04
+* Replace png application icon with svg
+* Use a launcher script to ensure that the desktop file is xdg compliant
+
+1.6 - 2022-06-01
+* Add a context menu to the subvolume page that sets read-only status, deletes subvolumes and creates new snapshots(Contributed by Adam Sowa)
+* Add the ability to delete multiple subvolumes
+* The subvolume backups made by Btrfs Assistant can now be restored
+* Add an option to add a name to the subvolume backups(Contributed by Zesko)
+* Add more detail to the subvolume tab table(Contributed by Adam Sowa)
+* The file browser is now sortable and the columns can be manually resized(Contributed by Adam Sowa)
+* Add support for deleting Snapper snapshots from the subvolume tab
+* Fix an issue where deleted Snapper configs were not being removed from UI(Contributed by Austin Horstman)
+* Fix an issue where the snapshot grid was not being refreshed properly
+* Fix issue where Snapper file reading was stopping on unprocessed elements
+* Remove some of the nested frames/boxes from the UI
+
+1.5 - 2022-04-30
+* Use libbtrfsutil instead of calling the btrfs command wherever possible
+* Allow opening multiple snapshot browse dialogs at the same time(Contributed by Adam Sowa)
+* Add the ability to filter subvolumes by name(Contributed by Adam Sowa)
+* Ensure the application works with or without systemd present
+* Numerous code quality improvements(Contributed by Adam Sowa)
+* Improve layout of the BtrfsMaintencance tab when resized
+* Move temporary mountpoint for filesystems to /run
+* Unmount filesystems mounted by the application on exit
+* Change the naming of subvolume backups to support nested subvolumes
+* Ensured combo boxes retain their selections when refreshed
+* Excluded snapshot 0 from Snapper tab since it isn't a snapshot
+* Use an xml parser to parse xml
+* Added a warning when restoring if you are mounting by subvolid in /etc/fstab
+* Fixed the handling of paths with whitespace in the Btrfs Maintenance tab
+* Reorganized the source code to make it more manageable(Contributed by Austin Horstman)
+* Lowered required C++ standard to C++ 17
+
+1.4 - 2022-04-14
+* Redesign the layout of the Subvolume tab(Contributed by Austin Horstman)
+* Modify the subvolume tab so it shows the subvolumes on all devices(Contributed by Austin Horstman)
+* The subvolume tab now can filter container subvolumes(With contributions from Adam Sowa)
+* The Subvolume grid is now sortable and the backend was optimized(Contributed by Adam Sowa)
+* Reworked the Snapper tab into separate tabs for New/Delete and Browse/Restore removing the Restore Mode checkbox
+* The grids on the Snapper tab now support sorting by any field
+* Renamed "Btrfs" tab to "Overview" and "Snapper - Settings" to "Snapper Settings"
+* Add refresh buttons to Snapper tabs
+* When snapper commands fail properly report them back to the user
+* Fix Qt warnings when running btrfs-assistant --version
+
+1.3 - 2022-04-08
+* The subvolume tab now shows the size and exclusive space used by each subvolume
+* Add button to enable and disable Btrfs quota support
+* Allow the Snapper config named "root" to be deleted
+* Add support for handling whitespace in paths
+* Streamline the load process to reduce the number of times data subvolume data is loaded
+* Switch from using a GUID in temporary paths to something more easily read
+
+1.2 - 2022-04-03
+* Added an integrated diff viewer
+* Changed font and alignment on scrub/balance output
+* Time is now displayed in local time format and no longer switches from local time to UTC in different views
+* Modified internal naming of UI elements for consistency and readability(Contributed by Austin Horstman)
+* Fixed an issue where nested subvolumes would were not able to restore
+* Modified cmake configuration to install all files
+
+1.1 - 2022-03-30
+* Added the ability to perform manual scrub and balance operations(Contributed by Austin Horstman)
+* Fixed an issue where the application crashes if snapper isn't installed
+
+1.0 - 2022-03-30
+* A large refactor of the entire code base including touching almost every section of the code
+* Removed all shell manipulation functions(sed/grep/awk/etc).  These functions are now performed in C++.
+* Added a snapshot browser to explore your Snapper snapshots
+* Added the abilty to restore individual files from snapshots
+* Added a basic CLI to list and restore snapshots
+* Removed the requirement that .snapshots must be a nested subvolume.  If you use non-nested subvolumes for snapshots, you can now specify those in the config
+* Removed the functionality to automatically launch the application when booting off a snapshot
+* Removed the checkboxes to manage Btrfs Maintenance systemd units because they were also being managed by Btrfs Maintenance which caused conflicts
+* Change the sort order of snapshots in restore mode so the most recent snapshots are first
+* There is now a small launcher script that launches the main binary which has been renamed to btrfs-assistant-bin
+* Added snapshot number to snapper restore grid
+* Added the snapshot type info to all snapshot views
+* Added the ability to manually name snapshots
+* Added date to backup subvolume name to make it easier to determine how old the backups were
+* The entire row is now selected when clicking in the grid on the Snapper tab
+* The subvolume list is now relative to the root of the Btrfs partition
+* Added tooltips to elements of the UI that needed further clarification(Contributed by Austin Horstman)
+
+0.9.1 - 2022-03-21
+* Fix bugs that caused nested subvolumes from being properly restored
+
+0.9 - 2022-03-19
+* Add more thorough support for Btrfs Maintenance
+* Major code refactor
+* Make Btrfs Maintenance and optional dependency
+* Add configuration file
+
+0.8 - 2021-12-12
+* Initial Release
