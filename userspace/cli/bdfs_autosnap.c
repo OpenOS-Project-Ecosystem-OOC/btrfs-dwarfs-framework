@@ -369,14 +369,12 @@ static int cmd_autosnap_rollback(struct bdfs_cli *cli, int argc, char *argv[])
 	char uuid_str[37];
 	bdfs_uuid_to_str(uuid, uuid_str);
 
+	/* Socket handler reads flat fields (no nested "args" object) */
 	snprintf(req, sizeof(req),
 		 "{\"cmd\":\"autosnap_rollback\","
-		 "\"args\":{"
-		 "\"partition\":\"%s\","
 		 "\"btrfs_mount\":\"%s\","
-		 "\"snapshot_name\":\"%s\""
-		 "}}\n",
-		 uuid_str, btrfs_mount, snap_name);
+		 "\"snapshot_name\":\"%s\"}\n",
+		 btrfs_mount, snap_name);
 
 	if (bdfs_cli_open_ctl(cli))
 		return 1;
@@ -557,17 +555,19 @@ static int cmd_autosnap_prune(struct bdfs_cli *cli, int argc, char *argv[])
 	char uuid_str[37];
 	bdfs_uuid_to_str(uuid, uuid_str);
 
+	/* Socket handler reads flat fields: "subvol", "pattern", "keep",
+	 * "demote_first", "dry_run" — not a nested "args" object. */
 	char req[1024];
 	snprintf(req, sizeof(req),
 		 "{\"cmd\":\"prune\","
-		 "\"args\":{"
-		 "\"btrfs_mount\":\"%s\","
+		 "\"subvol\":\"%s\","
 		 "\"pattern\":\"" AUTOSNAP_PATTERN "\","
 		 "\"keep\":%u,"
-		 "\"flags\":%u,"
-		 "\"compression\":%u"
-		 "}}\n",
-		 btrfs_mount, keep, flags, compression);
+		 "\"demote_first\":%s,"
+		 "\"dry_run\":%s}\n",
+		 btrfs_mount, keep,
+		 (flags & BDFS_PRUNE_DEMOTE_FIRST) ? "true" : "false",
+		 (flags & BDFS_PRUNE_DRY_RUN)      ? "true" : "false");
 
 	char resp[4096] = "";
 	int ret = bdfs_cli_send_recv(cli, req, resp, sizeof(resp));

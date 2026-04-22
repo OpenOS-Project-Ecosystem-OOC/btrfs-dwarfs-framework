@@ -99,6 +99,15 @@ static void *worker_thread(void *arg)
 		case BDFS_JOB_PROMOTE_COPYUP:
 			result = bdfs_job_promote_copyup(d, job);
 			break;
+		case BDFS_JOB_PRUNE:
+			result = bdfs_job_prune(d, job);
+			break;
+		case BDFS_JOB_MOUNT_BLEND_USERSPACE:
+			result = bdfs_job_mount_blend_userspace(d, job);
+			break;
+		case BDFS_JOB_AUTOSNAP_ROLLBACK:
+			result = bdfs_job_autosnap_rollback(d, job);
+			break;
 		default:
 			syslog(LOG_WARNING, "bdfs: unknown job type %d", job->type);
 			result = -EINVAL;

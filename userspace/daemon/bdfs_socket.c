@@ -430,6 +430,51 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 			snprintf(resp, sizeof(resp),
 				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
 
+	} else if (strstr(req, "\"cmd\":\"autosnap_rollback\"")) {
+		char btrfs_mount[BDFS_PATH_MAX] = {0};
+		char snapshot_name[BDFS_NAME_MAX + 1] = {0};
+
+		str_field(req, "btrfs_mount",   btrfs_mount,    sizeof(btrfs_mount));
+		str_field(req, "snapshot_name", snapshot_name,  sizeof(snapshot_name));
+
+		if (!btrfs_mount[0] || !snapshot_name[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":"
+				 "\"btrfs_mount and snapshot_name required\"}\n");
+			goto send;
+		}
+
+		if (strncmp(snapshot_name, "autosnap-", 9) != 0) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":"
+				 "\"snapshot_name must start with autosnap-\"}\n");
+			goto send;
+		}
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_AUTOSNAP_ROLLBACK);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+
+		strncpy(job->autosnap_rollback.btrfs_mount,
+			btrfs_mount, BDFS_PATH_MAX - 1);
+		strncpy(job->autosnap_rollback.snapshot_name,
+			snapshot_name, BDFS_NAME_MAX);
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\","
+				 "\"message\":\"rollback to '%s' queued; "
+				 "reboot to activate\"}\n",
+				 snapshot_name);
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n",
+				 r);
+
 	} else if (strstr(req, "\"cmd\":\"status\"") ||
 		   strstr(req, "\"status\"")) {
 		/* Count queued jobs */
