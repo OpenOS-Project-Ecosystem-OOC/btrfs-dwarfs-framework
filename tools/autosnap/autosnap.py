@@ -145,6 +145,65 @@ def detect_backend(cfg: Config) -> str:
     sys.exit(1)
 
 
+def resolve_partition_uuid(cfg: Config) -> str:
+    """
+    Return the bdfs partition UUID to use for snapshotting.
+
+    If BDFS_PARTITION_UUID is set in config, return it directly.
+    Otherwise query `bdfs partition list --json`:
+      - exactly one partition  → use it automatically
+      - zero partitions        → fatal: nothing registered
+      - multiple partitions    → fatal: ambiguous; require explicit config
+    """
+    explicit = str(cfg.BDFS_PARTITION_UUID).strip()
+    if explicit:
+        log.debug("Using configured BDFS_PARTITION_UUID: %s", explicit)
+        return explicit
+
+    bdfs_bin = str(cfg.BDFS_BIN)
+    try:
+        r = subprocess.run(
+            [bdfs_bin, "partition", "list", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            log.error("bdfs partition list failed: %s", r.stderr.strip())
+            sys.exit(1)
+    except FileNotFoundError:
+        log.error("bdfs binary not found: %s", bdfs_bin)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("bdfs partition list error: %s", exc)
+        sys.exit(1)
+
+    import re
+    uuids = re.findall(
+        r'"uuid"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+        r.stdout,
+    )
+
+    if len(uuids) == 0:
+        log.error(
+            "No bdfs partitions found. "
+            "Register a partition with 'bdfs partition add' first."
+        )
+        sys.exit(1)
+
+    if len(uuids) == 1:
+        log.info("Auto-detected single bdfs partition: %s", uuids[0])
+        return uuids[0]
+
+    # Multiple partitions — require explicit config
+    log.error(
+        "Multiple bdfs partitions found (%d). "
+        "Set BDFS_PARTITION_UUID in /etc/autosnap.conf to select one.",
+        len(uuids),
+    )
+    for u in uuids:
+        log.error("  %s", u)
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
@@ -214,16 +273,25 @@ class ShellBackend:
     def _run(self, action: str, *args: str) -> int:
         env = os.environ.copy()
         libdir = LIBDIR if LIBDIR.exists() else Path(__file__).parent
+
+        # Resolve partition UUID once here so the shell backend doesn't need
+        # to re-implement the multi-partition detection logic.
+        partition_uuid = (
+            resolve_partition_uuid(self.cfg)
+            if self.name == "bdfs"
+            else ""
+        )
+
         env.update({
-            "AUTOSNAP_LIBDIR":    str(libdir),
-            "AUTOSNAP_STATE_DIR": str(STATE_DIR),
-            "AUTOSNAP_DEBUG":     "1" if log.isEnabledFor(logging.DEBUG) else "0",
-            "BACKEND":            self.cfg.BACKEND,
-            "MAX_SNAPSHOTS":      str(self.cfg.MAX_SNAPSHOTS),
-            "RECORD_PACKAGES":    "true" if self.cfg.RECORD_PACKAGES else "false",
-            "BDFS_BIN":           str(self.cfg.BDFS_BIN),
-            "BDFS_SOCKET":        str(self.cfg.BDFS_SOCKET),
-            "BDFS_PARTITION_UUID": str(self.cfg.BDFS_PARTITION_UUID),
+            "AUTOSNAP_LIBDIR":         str(libdir),
+            "AUTOSNAP_STATE_DIR":      str(STATE_DIR),
+            "AUTOSNAP_DEBUG":          "1" if log.isEnabledFor(logging.DEBUG) else "0",
+            "BACKEND":                 str(self.cfg.BACKEND),
+            "MAX_SNAPSHOTS":           str(self.cfg.MAX_SNAPSHOTS),
+            "RECORD_PACKAGES":         "true" if self.cfg.RECORD_PACKAGES else "false",
+            "BDFS_BIN":                str(self.cfg.BDFS_BIN),
+            "BDFS_SOCKET":             str(self.cfg.BDFS_SOCKET),
+            "BDFS_PARTITION_UUID":     partition_uuid,
             "BDFS_DEMOTE_ON_PRUNE":
                 "true" if self.cfg.BDFS_DEMOTE_ON_PRUNE else "false",
             "BDFS_DEMOTE_COMPRESSION": str(self.cfg.BDFS_DEMOTE_COMPRESSION),

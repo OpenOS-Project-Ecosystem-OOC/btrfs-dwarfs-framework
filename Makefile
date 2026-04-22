@@ -7,7 +7,7 @@
 #   kernel           Build only the kernel module
 #   userspace        Build only the userspace tools
 #   install          Install everything (requires root for kernel module)
-#   install-autosnap Install the autosnap package-manager hook only
+#   install-autosnap Install the autosnap package-manager hook (opt-in)
 #   uninstall-autosnap Remove autosnap files
 #   clean            Remove all build artefacts
 #   test             Run integration tests
@@ -66,7 +66,7 @@ install-userspace: userspace
 
 # ── Combined ─────────────────────────────────────────────────────────────────
 
-install: install-kernel install-userspace install-autosnap install-post
+install: install-kernel install-userspace install-post
 
 # Post-install: refresh module dependencies, man page index, and systemd units.
 # Each step is best-effort (|| true) so install succeeds on minimal systems

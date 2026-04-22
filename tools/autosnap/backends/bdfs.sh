@@ -29,26 +29,52 @@ _bdfs_check() {
     fi
 }
 
-# Auto-detect the partition UUID from the btrfs root mountpoint if not set
+# Auto-detect the partition UUID.
+#
+# If BDFS_PARTITION_UUID is set in config, use it directly.
+# Otherwise query `bdfs partition list --json`:
+#   - exactly one partition → use it automatically
+#   - zero partitions       → error: nothing to snapshot
+#   - multiple partitions   → error: ambiguous; require explicit config
+#
+# The JSON output is one object per line with a "uuid" field, e.g.:
+#   {"uuid":"xxxxxxxx-...","mount":"/","label":"root"}
 _bdfs_detect_partition() {
     if [ -n "$BDFS_PARTITION_UUID" ]; then
-        log_debug "BDFS_PARTITION_UUID forced to '$BDFS_PARTITION_UUID' by config"
+        log_debug "BDFS_PARTITION_UUID set to '$BDFS_PARTITION_UUID' by config"
         return 0
     fi
 
-    # Ask the daemon for the partition whose mount covers /
-    _root_dev=$(findmnt -no SOURCE / 2>/dev/null)
-    BDFS_PARTITION_UUID=$("$BDFS_BIN" partition list --json 2>/dev/null \
-        | grep -o '"uuid":"[^"]*"' \
-        | head -1 \
-        | grep -o '[0-9a-f-]*')
-
-    if [ -z "$BDFS_PARTITION_UUID" ]; then
-        log_error "Could not detect bdfs partition UUID. Set BDFS_PARTITION_UUID in /etc/autosnap.conf"
+    _json=$("$BDFS_BIN" partition list --json 2>/dev/null) || {
+        log_error "bdfs partition list failed — is bdfs_daemon running?"
         return 1
-    fi
+    }
 
-    log_debug "Auto-detected BDFS_PARTITION_UUID: $BDFS_PARTITION_UUID"
+    # Extract all UUIDs (one per line)
+    _uuids=$(printf '%s\n' "$_json" \
+        | grep -o '"uuid":"[^"]*"' \
+        | grep -o '[0-9a-f-]\{36\}')
+
+    _count=$(printf '%s\n' "$_uuids" | grep -c . 2>/dev/null || echo 0)
+
+    case "$_count" in
+        0)
+            log_error "No bdfs partitions found. Register a partition with 'bdfs partition add' first."
+            return 1
+            ;;
+        1)
+            BDFS_PARTITION_UUID=$(printf '%s\n' "$_uuids" | head -1)
+            log_info "Auto-detected single bdfs partition: $BDFS_PARTITION_UUID"
+            ;;
+        *)
+            log_error "Multiple bdfs partitions found ($_count). Set BDFS_PARTITION_UUID in /etc/autosnap.conf."
+            log_error "Available partitions:"
+            printf '%s\n' "$_uuids" | while read -r _u; do
+                log_error "  $_u"
+            done
+            return 1
+            ;;
+    esac
 }
 
 _bdfs_snap_name() {
@@ -124,19 +150,33 @@ _enforce_max_snapshots_bdfs() {
     _mount="${1:-/}"
     [ "${MAX_SNAPSHOTS:-5}" -le 0 ] && return
 
-    # Delegate retention to bdfs snapshot prune, which supports --demote-first
+    # Check whether this bdfs build supports --pattern in snapshot prune.
+    # If not, fall back to pruning without a pattern filter (prunes all
+    # snapshots under the mount, not just autosnap ones — warn the user).
+    _prune_help=$("$BDFS_BIN" snapshot prune --help 2>&1 || true)
+    _pattern_flag=""
+    if printf '%s' "$_prune_help" | grep -q -- '--pattern'; then
+        _pattern_flag="--pattern autosnap-*"
+    else
+        log_warn "bdfs snapshot prune --pattern not supported in this build; pruning all snapshots under $_mount"
+    fi
+
     _demote_flag=""
-    [ "${BDFS_DEMOTE_ON_PRUNE:-false}" = "true" ] && \
+    if [ "${BDFS_DEMOTE_ON_PRUNE:-false}" = "true" ]; then
         _demote_flag="--demote-first --compression ${BDFS_DEMOTE_COMPRESSION:-zstd}"
+    fi
 
     # shellcheck disable=SC2086
-    "$BDFS_BIN" snapshot prune \
-        --partition "$BDFS_PARTITION_UUID" \
-        --btrfs-mount "$_mount" \
-        --keep "$MAX_SNAPSHOTS" \
-        --pattern "autosnap-*" \
-        $_demote_flag 2>/dev/null \
-        && log_info "bdfs snapshot prune: kept $MAX_SNAPSHOTS autosnap snapshots"
+    if "$BDFS_BIN" snapshot prune \
+            --partition "$BDFS_PARTITION_UUID" \
+            --btrfs-mount "$_mount" \
+            --keep "$MAX_SNAPSHOTS" \
+            $_pattern_flag \
+            $_demote_flag 2>/dev/null; then
+        log_info "bdfs snapshot prune: kept $MAX_SNAPSHOTS snapshots under $_mount"
+    else
+        log_warn "bdfs snapshot prune failed — snapshots may accumulate until pruned manually"
+    fi
 }
 
 backend_list() {

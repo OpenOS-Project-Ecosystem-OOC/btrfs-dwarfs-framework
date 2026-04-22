@@ -38,6 +38,7 @@ int cmd_status(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_verify(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_setup(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_home(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_autosnap(struct bdfs_cli *cli, int argc, char *argv[]);
 
 /* ── Command table ───────────────────────────────────────────────────────── */
 
@@ -73,6 +74,8 @@ static const struct bdfs_command COMMANDS[] = {
 	  "Setup utilities: fstab generation, dependency check" },
 	{ "home",      NULL,     cmd_home,
 	  "Home directory subvolume init, snapshots, and DwarFS archival" },
+	{ "autosnap",  NULL,     cmd_autosnap,
+	  "Manage package-manager snapshots (list, delete, rollback, status, prune)" },
 };
 
 /* blend is a sub-namespace: `bdfs blend mount` / `bdfs blend umount` */
@@ -130,7 +133,8 @@ static void print_usage(void)
 	printf("  %-22s  %s\n", "blend umount",
 	       "Unmount the blend layer");
 	printf("\n"
-	       "Run 'bdfs <command> --help' for command-specific options.\n");
+	       "Run 'bdfs <command> --help' for command-specific options.\n"
+	       "Run 'bdfs autosnap --help' for package-manager snapshot management.\n");
 }
 
 /* ── Entry point ─────────────────────────────────────────────────────────── */

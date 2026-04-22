@@ -94,4 +94,7 @@ uint32_t    bdfs_compression_from_name(const char *name);
 void bdfs_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void bdfs_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* autosnap subcommand group */
+int cmd_autosnap(struct bdfs_cli *cli, int argc, char *argv[]);
+
 #endif /* _BDFS_CLI_H */

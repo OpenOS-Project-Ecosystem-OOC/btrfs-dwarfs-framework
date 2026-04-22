@@ -107,6 +107,7 @@ if(BUILD_CLI)
         cli/bdfs_status.c
         cli/bdfs_verify.c
         cli/bdfs_policy.c
+        cli/bdfs_autosnap.c
     )
 
     target_include_directories(bdfs PRIVATE
