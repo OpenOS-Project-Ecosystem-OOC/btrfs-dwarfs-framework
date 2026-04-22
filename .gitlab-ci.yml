@@ -16,10 +16,53 @@ lint:
     - |
       failed=0
       for f in $(find . -name "*.sh" ! -path "./.git/*"); do
-        bash -n "$f" || { echo "FAIL syntax: $f"; failed=1; }
-        shellcheck --severity=error "$f" || { echo "FAIL shellcheck: $f"; failed=1; }
+        # autosnap scripts target POSIX sh; all others are bash
+        if echo "$f" | grep -q "tools/autosnap"; then
+          sh -n "$f" || { echo "FAIL syntax: $f"; failed=1; }
+          shellcheck --shell=sh --severity=warning \
+            --exclude=SC1091,SC2034 "$f" \
+            || { echo "FAIL shellcheck: $f"; failed=1; }
+        else
+          bash -n "$f" || { echo "FAIL syntax: $f"; failed=1; }
+          shellcheck --severity=error "$f" \
+            || { echo "FAIL shellcheck: $f"; failed=1; }
+        fi
       done
       exit $failed
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+autosnap-python-lint:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install --quiet pyflakes
+  script:
+    - |
+      echo "==> pyflakes (hooks/dnf excluded: requires dnf runtime)"
+      python3 -m pyflakes \
+        tools/autosnap/autosnap.py \
+        tools/autosnap/hooks/zypper/autosnap.py
+    - |
+      echo "==> py_compile syntax check"
+      python3 -m py_compile tools/autosnap/autosnap.py \
+        && echo "OK: autosnap.py"
+      python3 -m py_compile tools/autosnap/hooks/dnf/autosnap.py \
+        && echo "OK: hooks/dnf/autosnap.py"
+      python3 -m py_compile tools/autosnap/hooks/zypper/autosnap.py \
+        && echo "OK: hooks/zypper/autosnap.py"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+autosnap-makefile-check:
+  stage: test
+  before_script:
+    - apt-get update -qq && apt-get install -y make
+  script:
+    - make --dry-run install-autosnap DESTDIR=/tmp/bdfs-test
+    - make --dry-run uninstall-autosnap DESTDIR=/tmp/bdfs-test
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'

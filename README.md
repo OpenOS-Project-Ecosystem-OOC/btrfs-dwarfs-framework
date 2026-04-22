@@ -149,6 +149,7 @@ btrfs-dwarfs-framework/
 │   └── bdfs-balance.{sh,service,timer}  # Monthly balance
 │
 ├── tools/
+│   ├── autosnap/                 # Package-manager snapshot hook (see below)
 │   ├── homed/                    # systemd-homed identity repair (distro-agnostic)
 │   └── setup/
 │       └── bdfs-genfstab.sh      # Runtime fstab generator
@@ -374,6 +375,87 @@ sudo bash boot/install.sh --maintenance
 ```bash
 bdfs status
 bdfs status --json
+```
+
+---
+
+## autosnap — package-manager snapshot hook
+
+`tools/autosnap/` integrates automatic pre/post snapshots into your package
+manager so every install, upgrade, or removal is preceded by a recoverable
+system snapshot.
+
+**Primary backend:** `bdfs snapshot` (daemon-managed, supports `--demote-first`
+archival and `bdfs snapshot prune` retention).  
+**Fallback backend:** raw `btrfs subvolume snapshot` (used automatically when
+the bdfs daemon is not running).
+
+### Install
+
+```bash
+sudo make install-autosnap
+```
+
+This installs hooks for all detected package managers (APT, DNF, Pacman,
+Zypper). Edit `/etc/autosnap.conf` to configure retention and demote behaviour.
+
+### How it works
+
+```
+apt install / dnf upgrade / pacman -Syu / zypper up
+        │
+        ▼
+  [pre hook]  autosnap pre <pm>
+        │  → bdfs snapshot --name autosnap-pre-<date>-<pm>
+        │  → bdfs snapshot prune --pattern "autosnap-*" --keep $MAX_SNAPSHOTS
+        │
+  [package manager runs]
+        │
+  [post hook]  autosnap post <pm>
+        │  → bdfs snapshot --name autosnap-post-<date>-<pm>
+```
+
+### Management
+
+```bash
+# List autosnap snapshots
+autosnap list
+
+# Show what changed between pre and post
+autosnap status autosnap-pre-2026-01-01T12:00:00-apt \
+                autosnap-post-2026-01-01T12:00:01-apt
+
+# Roll back to a pre-snapshot
+sudo autosnap rollback autosnap-pre-2026-01-01T12:00:00-apt
+
+# Delete a snapshot
+autosnap delete autosnap-pre-2026-01-01T12:00:00-apt
+
+# Skip snapshotting for one run
+SKIP_AUTOSNAP= sudo apt upgrade
+```
+
+### Retention and DwarFS archival
+
+Retention is enforced via `bdfs snapshot prune`. With `BDFS_DEMOTE_ON_PRUNE=true`
+in `/etc/autosnap.conf`, snapshots beyond `MAX_SNAPSHOTS` are compressed into
+DwarFS archives before deletion rather than discarded outright:
+
+```bash
+# Equivalent manual command
+bdfs snapshot prune \
+    --partition <uuid> \
+    --btrfs-mount / \
+    --keep 5 \
+    --pattern "autosnap-*" \
+    --demote-first \
+    --compression zstd
+```
+
+### Uninstall
+
+```bash
+sudo make uninstall-autosnap
 ```
 
 ---
