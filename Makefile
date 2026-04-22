@@ -7,6 +7,8 @@
 #   kernel           Build only the kernel module
 #   userspace        Build only the userspace tools
 #   install          Install everything (requires root for kernel module)
+#   install-autosnap Install the autosnap package-manager hook only
+#   uninstall-autosnap Remove autosnap files
 #   clean            Remove all build artefacts
 #   test             Run integration tests
 #   check            Run unit tests (requires cmake -DBUILD_TESTS=ON)
@@ -21,7 +23,14 @@ KDIR      ?= /lib/modules/$(shell uname -r)/build
 PREFIX    ?= /usr/local
 BUILD_DIR ?= build/userspace
 
+# autosnap install paths — co-located under /usr/lib/bdfs/autosnap/
+AUTOSNAP_LIBDIR  ?= /usr/lib/bdfs/autosnap
+AUTOSNAP_BINDIR  ?= $(PREFIX)/bin
+AUTOSNAP_CONFDIR ?= /etc
+AUTOSNAP_STATEDIR ?= /var/lib/autosnap
+
 .PHONY: all kernel userspace install install-kernel install-userspace \
+        install-autosnap uninstall-autosnap \
         clean clean-kernel clean-userspace test check fmt
 
 all: kernel userspace
@@ -57,7 +66,7 @@ install-userspace: userspace
 
 # ── Combined ─────────────────────────────────────────────────────────────────
 
-install: install-kernel install-userspace install-post
+install: install-kernel install-userspace install-autosnap install-post
 
 # Post-install: refresh module dependencies, man page index, and systemd units.
 # Each step is best-effort (|| true) so install succeeds on minimal systems
@@ -70,6 +79,63 @@ install-post:
 	    systemctl daemon-reload; \
 	    echo "systemd units reloaded"; \
 	fi
+
+# ── autosnap ─────────────────────────────────────────────────────────────────
+
+install-autosnap:
+	# Core library
+	install -d $(DESTDIR)$(AUTOSNAP_LIBDIR)/backends
+	install -d $(DESTDIR)$(AUTOSNAP_LIBDIR)/lib
+	install -d $(DESTDIR)$(AUTOSNAP_STATEDIR)
+	install -Dm644 tools/autosnap/lib/common.sh \
+	    $(DESTDIR)$(AUTOSNAP_LIBDIR)/lib/common.sh
+	install -Dm644 tools/autosnap/backends/bdfs.sh \
+	    $(DESTDIR)$(AUTOSNAP_LIBDIR)/backends/bdfs.sh
+	install -Dm644 tools/autosnap/backends/btrfs.sh \
+	    $(DESTDIR)$(AUTOSNAP_LIBDIR)/backends/btrfs.sh
+	install -Dm755 tools/autosnap/autosnap.py \
+	    $(DESTDIR)$(AUTOSNAP_LIBDIR)/autosnap.py
+	# Main dispatcher — patch LIBDIR and PYCORE paths
+	install -Dm755 tools/autosnap/autosnap \
+	    $(DESTDIR)$(AUTOSNAP_BINDIR)/autosnap
+	sed -i \
+	    -e 's|^AUTOSNAP_LIBDIR=.*|AUTOSNAP_LIBDIR="$(AUTOSNAP_LIBDIR)"|' \
+	    -e 's|^AUTOSNAP_PYCORE=.*|AUTOSNAP_PYCORE="$(AUTOSNAP_LIBDIR)/autosnap.py"|' \
+	    $(DESTDIR)$(AUTOSNAP_BINDIR)/autosnap
+	# Config (do not overwrite existing)
+	install -Dm644 tools/autosnap/autosnap.conf \
+	    $(DESTDIR)$(AUTOSNAP_CONFDIR)/autosnap.conf
+	# APT hook
+	install -d $(DESTDIR)/etc/apt/apt.conf.d
+	install -Dm644 tools/autosnap/hooks/apt/80-autosnap \
+	    $(DESTDIR)/etc/apt/apt.conf.d/80-autosnap
+	# DNF plugin
+	install -d $(DESTDIR)$(PREFIX)/lib/python3/dist-packages/dnf-plugins
+	install -Dm644 tools/autosnap/hooks/dnf/autosnap.py \
+	    $(DESTDIR)$(PREFIX)/lib/python3/dist-packages/dnf-plugins/autosnap.py
+	# Pacman hooks
+	install -d $(DESTDIR)$(PREFIX)/share/libalpm/hooks
+	install -Dm644 tools/autosnap/hooks/pacman/autosnap.hook \
+	    $(DESTDIR)$(PREFIX)/share/libalpm/hooks/autosnap-pre.hook
+	install -Dm644 tools/autosnap/hooks/pacman/autosnap-post.hook \
+	    $(DESTDIR)$(PREFIX)/share/libalpm/hooks/autosnap-post.hook
+	# Zypper plugin
+	install -d $(DESTDIR)/usr/lib/zypp/plugins/commit
+	install -Dm755 tools/autosnap/hooks/zypper/autosnap.py \
+	    $(DESTDIR)/usr/lib/zypp/plugins/commit/autosnap
+	@echo "autosnap installed. Edit $(AUTOSNAP_CONFDIR)/autosnap.conf to configure."
+	@echo "Run 'autosnap detect' to verify backend detection."
+
+uninstall-autosnap:
+	rm -rf  $(DESTDIR)$(AUTOSNAP_LIBDIR)
+	rm -f   $(DESTDIR)$(AUTOSNAP_BINDIR)/autosnap
+	rm -f   $(DESTDIR)/etc/apt/apt.conf.d/80-autosnap
+	rm -f   $(DESTDIR)$(PREFIX)/lib/python3/dist-packages/dnf-plugins/autosnap.py
+	rm -f   $(DESTDIR)$(PREFIX)/share/libalpm/hooks/autosnap-pre.hook
+	rm -f   $(DESTDIR)$(PREFIX)/share/libalpm/hooks/autosnap-post.hook
+	rm -f   $(DESTDIR)/usr/lib/zypp/plugins/commit/autosnap
+	@echo "autosnap uninstalled."
+	@echo "Config $(AUTOSNAP_CONFDIR)/autosnap.conf and state $(AUTOSNAP_STATEDIR) were NOT removed."
 
 clean: clean-kernel clean-userspace
 
