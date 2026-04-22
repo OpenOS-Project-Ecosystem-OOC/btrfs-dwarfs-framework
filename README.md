@@ -170,12 +170,17 @@ btrfs-dwarfs-framework/
 │       ├── test_compression.c
 │       └── test_job_alloc.c
 │
-└── doc/
-    ├── architecture.md
-    ├── bootloader-integration.md # GRUB2 / systemd-boot / Limine
-    ├── distro-agnostic.md        # Policy: no hardcoded distro assumptions
-    ├── bdfs.1
-    └── bdfs_daemon.8
+├── doc/
+│   ├── architecture.md
+│   ├── bootloader-integration.md # GRUB2 / systemd-boot / Limine
+│   ├── distro-agnostic.md        # Policy: no hardcoded distro assumptions
+│   ├── bdfs.1
+│   └── bdfs_daemon.8
+│
+└── integrations/                 # Git submodules — external projects that integrate with bdfs
+    ├── frzr-meta-root/           # Immutable root manager (frzr + ABRoot v2, Incus backend)
+    ├── btr-fs-git/               # Git-like workflow for btrfs subvolumes (BFG)
+    └── btrfs-assistant/          # Qt6 GUI with BDFS tab for daemon interaction
 ```
 
 ---
@@ -499,11 +504,51 @@ man doc/bdfs_daemon.8
 
 ---
 
+## Ecosystem
+
+The `integrations/` directory contains projects that extend or consume btrfs-dwarfs-framework, tracked as git submodules. Each stays in its own repository with its own CI and release cadence.
+
+To initialise after cloning:
+
+```bash
+git submodule update --init --recursive integrations/
+```
+
+To update a specific integration to its latest upstream commit:
+
+```bash
+git submodule update --remote integrations/frzr-meta-root
+git add integrations/frzr-meta-root
+git commit -m "integrations/frzr-meta-root: update to latest"
+```
+
+### frzr-meta-root ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/frzr-meta-root))
+
+A unified fork of [frzr](https://gitlab.com/openos-project/upstream-mirrors/frzr) and ABRoot v2 that uses [Incus](https://gitlab.com/openos-project/incus_deving/incus) as the sole OCI backend for immutable root filesystem management. Integrates with bdfs via `core/bdfs.go`, which archives retiring frzr deployments as DwarFS images before deletion — so old OS states are compressed and recoverable rather than discarded.
+
+Supports two deployment models: A/B partitions (strongest atomicity) and btrfs subvolumes (drop-in for existing frzr installs).
+
+### btr-fs-git / BFG ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btr-fs-git))
+
+A Python tool that provides git-like workflow (`push`, `pull`, `commit`, `checkout`, `stash`) for btrfs subvolumes across multiple machines. Integrates with bdfs via `btrfsgit/btrfsgit_bdfs_patch.py`, which monkey-patches `push`/`pull` to accept `--compress-via-bdfs`: snapshots are compressed as DwarFS images in transit, reducing transfer size by 10–16×, then decompressed on the receiving end.
+
+### btrfs-assistant ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btrfs-assistant))
+
+A Qt6 GUI for btrfs filesystem management. Includes a **BDFS tab** (`src/ui/BdfsPartitionsTab`) that communicates with the bdfs daemon over its Unix socket (`/run/bdfs/bdfs.sock`), providing a graphical interface for:
+
+- Viewing BTRFS partitions, DwarFS images, and active blend mounts
+- Mounting and unmounting blend layers (kernel or fuse-overlayfs mode)
+- Demoting snapshots to compressed DwarFS images
+- Importing DwarFS images back as BTRFS subvolumes
+- Pruning snapshots with keep-N policy, name pattern filter, demote-before-delete, and dry-run mode
+
+The BDFS tab disables itself gracefully when the daemon is not running.
+
+---
+
 ## Known Limitations
 
 - **Blend layer inode routing is a skeleton.** The `bdfs_blend` VFS type is registered and blend mount/umount ioctls are wired, but full inode routing across the BTRFS/DwarFS boundary in `bdfs_blend_lookup` requires kernel-version-specific FUSE internal API work and is not yet complete. Use `--userspace` (fuse-overlayfs) for a fully functional blend layer today.
-- **Incremental export not wired.** The `--incremental` flag is accepted but `btrfs send -p <parent>` is not yet passed through in the daemon job handler.
-- **Read-only import is stubbed.** The `--readonly` flag on `bdfs import` constructs the `btrfs property set ro true` call but does not execute it yet.
 
 ---
 
