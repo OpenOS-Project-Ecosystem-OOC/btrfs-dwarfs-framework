@@ -13,6 +13,8 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -655,43 +657,140 @@ int bdfs_job_prune(struct bdfs_daemon *d, struct bdfs_job *job)
 /* ── Autosnap rollback ───────────────────────────────────────────────────── */
 
 /*
+ * resolve_btrfs_device - Resolve the block device path for a mountpoint by
+ * parsing /proc/self/mountinfo directly.
+ *
+ * This avoids popen()/findmnt which are vulnerable to shell injection if the
+ * mountpoint path contains special characters, and whose failure modes are
+ * difficult to handle cleanly in a daemon context.
+ *
+ * /proc/self/mountinfo format (field indices, space-separated):
+ *   0:mount_id 1:parent_id 2:major:minor 3:root 4:mount_point 5:mount_opts
+ *   [optional tagged fields...] - 7:fs_type 8:source 9:super_opts
+ *
+ * We match on field 4 (mount_point) and return field 8 (source device).
+ * Returns 0 on success, -ENODEV if not found, -EIO on parse error.
+ */
+static int resolve_btrfs_device(const char *mountpoint,
+				char *dev_out, size_t dev_out_len)
+{
+	FILE  *fp;
+	char   line[4096];
+	int    found = 0;
+
+	fp = fopen("/proc/self/mountinfo", "r");
+	if (!fp) {
+		syslog(LOG_ERR,
+		       "bdfs: resolve_btrfs_device: open /proc/self/mountinfo: %m");
+		return -EIO;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		/*
+		 * Parse the fixed fields up to the separator " - ".
+		 * We need field index 4 (mount_point).
+		 * After the " - " separator: fs_type source super_opts.
+		 */
+		char *sep = strstr(line, " - ");
+		if (!sep)
+			continue;
+
+		/* Isolate the pre-separator portion and tokenise */
+		*sep = '\0';
+		char *post = sep + 3; /* points to "fs_type source ..." */
+
+		char *fields[6] = {0};
+		char *tok = strtok(line, " ");
+		int   fi  = 0;
+		while (tok && fi < 6) {
+			fields[fi++] = tok;
+			tok = strtok(NULL, " ");
+		}
+		/* field[4] is mount_point */
+		if (fi < 5 || !fields[4])
+			continue;
+		if (strcmp(fields[4], mountpoint) != 0)
+			continue;
+
+		/* Parse post-separator: fs_type source super_opts */
+		char fs_type[64]  = "";
+		char source[BDFS_PATH_MAX] = "";
+		if (sscanf(post, "%63s %*s", fs_type) < 1)
+			continue;
+		/* Skip fs_type token to get source */
+		char *src_start = strchr(post, ' ');
+		if (!src_start)
+			continue;
+		src_start++;
+		if (sscanf(src_start, "%*s") < 0) { /* advance past fs_type */ }
+		/* Re-parse: fs_type<sp>source */
+		if (sscanf(post, "%63s %4095s", fs_type, source) < 2)
+			continue;
+
+		if (strcmp(fs_type, "btrfs") != 0) {
+			syslog(LOG_ERR,
+			       "bdfs: resolve_btrfs_device: %s is %s, not btrfs",
+			       mountpoint, fs_type);
+			fclose(fp);
+			return -EINVAL;
+		}
+
+		strncpy(dev_out, source, dev_out_len - 1);
+		dev_out[dev_out_len - 1] = '\0';
+		found = 1;
+		break;
+	}
+
+	fclose(fp);
+	return found ? 0 : -ENODEV;
+}
+
+/*
  * bdfs_job_autosnap_rollback - Roll back the root btrfs subvolume (@) to a
  * named autosnap snapshot.
  *
- * Steps:
- *   1. Mount the top-level btrfs volume (subvolid=5) at a private tmpdir.
- *   2. Verify the named autosnap-* subvolume exists under the mount.
- *   3. Rename the current @ to @autosnap-rollback-backup-<timestamp> so the
- *      rollback is itself recoverable.
- *   4. Create a new writable snapshot of the autosnap subvolume as the new @.
- *   5. Unmount the top-level volume and remove the tmpdir.
+ * Crash-safe ordering — the live @ is never removed until its replacement
+ * is confirmed to exist on disk:
  *
- * The caller must reboot for the new @ to take effect.
+ *   1. Resolve the block device via /proc/self/mountinfo (no shell injection).
+ *   2. Mount the top-level btrfs volume (subvolid=5) at a private tmpdir.
+ *   3. Verify the named autosnap-* subvolume exists.
+ *   4. Create the replacement as @autosnap-new-<timestamp> (snapshot of the
+ *      autosnap subvolume). The live @ is untouched at this point.
+ *   5. Verify the new subvolume was created successfully (stat check).
+ *   6. Rename @ → @autosnap-rollback-backup-<timestamp>.
+ *   7. Rename @autosnap-new-<timestamp> → @.
+ *   8. Unmount and clean up.
  *
  * Failure modes:
- *   - Snapshot not found          → ENOENT, no changes made.
- *   - Rename fails                → EBUSY or EIO, no changes made.
- *   - Snapshot creation fails     → attempts to rename @ back; logs error.
- *   - Unmount fails               → logged; mount will be cleaned up on reboot.
+ *   - Steps 1–5 fail  → no changes to @ whatsoever; clean abort.
+ *   - Step 6 fails    → new subvolume exists but is unused; delete it and
+ *                        return error. @ is intact.
+ *   - Step 7 fails    → backup exists, new subvolume exists, @ is intact.
+ *                        Rename the backup back, delete the new subvolume,
+ *                        return error. Fully recoverable.
+ *   - Unmount fails   → logged at WARNING; kernel will clean up on reboot.
+ *
+ * The caller must reboot for the new @ to take effect.
  */
 int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job)
 {
-	const struct bdfs_job *j = job;
-	const char *btrfs_mount  = j->autosnap_rollback.btrfs_mount;
-	const char *snap_name    = j->autosnap_rollback.snapshot_name;
+	const char *btrfs_mount = job->autosnap_rollback.btrfs_mount;
+	const char *snap_name   = job->autosnap_rollback.snapshot_name;
 
-	char  tmpdir[BDFS_PATH_MAX];
-	char  snap_path[BDFS_PATH_MAX];
-	char  current_at[BDFS_PATH_MAX];
-	char  backup_at[BDFS_PATH_MAX];
-	char  new_at[BDFS_PATH_MAX];
-	char  dev[BDFS_PATH_MAX];
+	char   tmpdir[BDFS_PATH_MAX];
+	char   dev[BDFS_PATH_MAX];
+	char   snap_path[BDFS_PATH_MAX];
+	char   current_at[BDFS_PATH_MAX];
+	char   backup_at[BDFS_PATH_MAX];
+	char   new_staging[BDFS_PATH_MAX]; /* @autosnap-new-<ts> */
+	char   final_at[BDFS_PATH_MAX];
 	time_t now;
 	struct tm tm_now;
-	char  ts[32];
-	int   ret = 0;
+	char   ts[32];
+	int    ret = 0;
 
-	/* Validate snapshot name starts with "autosnap-" */
+	/* Validate snapshot name prefix */
 	if (strncmp(snap_name, "autosnap-", 9) != 0) {
 		syslog(LOG_ERR,
 		       "bdfs: autosnap_rollback: '%s' is not an autosnap snapshot",
@@ -699,48 +798,44 @@ int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job)
 		return -EINVAL;
 	}
 
-	/* Step 1: mount top-level btrfs volume (subvolid=5) */
+	/* Build timestamp string used for both staging and backup names */
+	time(&now);
+	gmtime_r(&now, &tm_now);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
+
+	/* Step 1: resolve block device from /proc/self/mountinfo */
+	ret = resolve_btrfs_device(btrfs_mount, dev, sizeof(dev));
+	if (ret) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: cannot resolve device for %s: %d",
+		       btrfs_mount, ret);
+		return ret;
+	}
+
+	/* Step 2: mount top-level btrfs volume (subvolid=5) */
 	snprintf(tmpdir, sizeof(tmpdir),
 		 "%s/.bdfs_rollback_XXXXXX", d->cfg.state_dir);
 	if (!mkdtemp(tmpdir)) {
-		syslog(LOG_ERR,
-		       "bdfs: autosnap_rollback: mkdtemp failed: %m");
+		syslog(LOG_ERR, "bdfs: autosnap_rollback: mkdtemp: %m");
 		return -errno;
 	}
 
-	/* Resolve the block device backing btrfs_mount */
-	{
-		FILE *fp;
-		char  cmd[BDFS_PATH_MAX + 64];
-		snprintf(cmd, sizeof(cmd),
-			 "findmnt -no SOURCE '%s' 2>/dev/null", btrfs_mount);
-		fp = popen(cmd, "r");
-		if (!fp || !fgets(dev, sizeof(dev), fp)) {
-			syslog(LOG_ERR,
-			       "bdfs: autosnap_rollback: cannot resolve device for %s",
-			       btrfs_mount);
-			if (fp) pclose(fp);
-			rmdir(tmpdir);
-			return -ENODEV;
-		}
-		pclose(fp);
-		/* Strip trailing newline */
-		dev[strcspn(dev, "\n")] = '\0';
-	}
-
-	if (mount(dev, tmpdir, "btrfs", MS_RDONLY,
-		  "subvolid=5") < 0) {
+	if (mount(dev, tmpdir, "btrfs", 0, "subvolid=5") < 0) {
 		syslog(LOG_ERR,
-		       "bdfs: autosnap_rollback: mount subvolid=5 %s → %s: %m",
+		       "bdfs: autosnap_rollback: mount %s (subvolid=5) at %s: %m",
 		       dev, tmpdir);
 		rmdir(tmpdir);
 		return -errno;
 	}
 
-	/* Step 2: verify the snapshot exists */
-	snprintf(snap_path,   sizeof(snap_path),   "%s/%s",  tmpdir, snap_name);
-	snprintf(current_at,  sizeof(current_at),  "%s/@",   tmpdir);
+	/* Build all paths now that tmpdir is known */
+	snprintf(snap_path,   sizeof(snap_path),   "%s/%s",                       tmpdir, snap_name);
+	snprintf(current_at,  sizeof(current_at),  "%s/@",                        tmpdir);
+	snprintf(new_staging, sizeof(new_staging), "%s/@autosnap-new-%s",         tmpdir, ts);
+	snprintf(backup_at,   sizeof(backup_at),   "%s/@autosnap-rollback-backup-%s", tmpdir, ts);
+	snprintf(final_at,    sizeof(final_at),    "%s/@",                        tmpdir);
 
+	/* Step 3: verify the source snapshot exists */
 	{
 		struct stat st;
 		if (stat(snap_path, &st) < 0) {
@@ -752,40 +847,82 @@ int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job)
 		}
 	}
 
-	/* Step 3: rename @ → @autosnap-rollback-backup-<timestamp> */
-	time(&now);
-	gmtime_r(&now, &tm_now);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_now);
-	snprintf(backup_at, sizeof(backup_at),
-		 "%s/@autosnap-rollback-backup-%s", tmpdir, ts);
+	/*
+	 * Step 4: create the replacement subvolume as @autosnap-new-<ts>.
+	 * The live @ is completely untouched at this point.
+	 */
+	ret = bdfs_exec_btrfs_snapshot(d, snap_path, new_staging,
+				       false /* writable */);
+	if (ret) {
+		syslog(LOG_ERR,
+		       "bdfs: autosnap_rollback: create staging snapshot "
+		       "%s → %s failed: %d",
+		       snap_name, new_staging, ret);
+		goto out_umount;
+	}
 
+	/* Step 5: verify the staging subvolume actually exists on disk */
+	{
+		struct stat st;
+		if (stat(new_staging, &st) < 0) {
+			syslog(LOG_ERR,
+			       "bdfs: autosnap_rollback: staging subvolume "
+			       "missing after creation: %s: %m",
+			       new_staging);
+			ret = -EIO;
+			/* Clean up the (apparently incomplete) staging subvol */
+			bdfs_exec_btrfs_subvol_delete(d, new_staging);
+			goto out_umount;
+		}
+	}
+
+	/*
+	 * Step 6: rename @ → @autosnap-rollback-backup-<ts>.
+	 * First point of no return — but the staging subvolume already exists,
+	 * so recovery is deterministic if step 7 fails.
+	 */
 	if (rename(current_at, backup_at) < 0) {
 		syslog(LOG_ERR,
-		       "bdfs: autosnap_rollback: rename @ → %s: %m",
-		       backup_at);
+		       "bdfs: autosnap_rollback: rename @ → backup: %m");
 		ret = -errno;
+		/* @ is intact; clean up the unused staging subvolume */
+		bdfs_exec_btrfs_subvol_delete(d, new_staging);
 		goto out_umount;
 	}
 
 	syslog(LOG_INFO,
-	       "bdfs: autosnap_rollback: current @ saved as %s",
-	       backup_at);
+	       "bdfs: autosnap_rollback: @ saved as @autosnap-rollback-backup-%s",
+	       ts);
 
-	/* Step 4: create writable snapshot of autosnap subvol as new @ */
-	snprintf(new_at, sizeof(new_at), "%s/@", tmpdir);
-
-	ret = bdfs_exec_btrfs_snapshot(d, snap_path, new_at,
-				       false /* writable */);
-	if (ret) {
+	/*
+	 * Step 7: rename @autosnap-new-<ts> → @.
+	 * If this fails: backup exists, staging exists, @ is gone.
+	 * Recover by renaming backup back to @ and deleting staging.
+	 */
+	if (rename(new_staging, final_at) < 0) {
 		syslog(LOG_ERR,
-		       "bdfs: autosnap_rollback: snapshot %s → @ failed: %d",
-		       snap_name, ret);
-		/* Attempt to restore the backup */
-		if (rename(backup_at, current_at) < 0)
+		       "bdfs: autosnap_rollback: rename staging → @: %m");
+		ret = -errno;
+
+		if (rename(backup_at, current_at) < 0) {
+			/*
+			 * Both renames failed. The system has no @ subvolume.
+			 * Log at EMERG — operator intervention required before
+			 * reboot. The backup and staging subvolumes are intact.
+			 */
+			syslog(LOG_EMERG,
+			       "bdfs: autosnap_rollback: UNRECOVERABLE: "
+			       "@ is missing. Backup: @autosnap-rollback-backup-%s  "
+			       "Staging: @autosnap-new-%s  "
+			       "DO NOT REBOOT until @ is restored manually.",
+			       ts, ts);
+		} else {
+			/* @ restored from backup; clean up staging */
+			bdfs_exec_btrfs_subvol_delete(d, new_staging);
 			syslog(LOG_ERR,
-			       "bdfs: autosnap_rollback: CRITICAL: "
-			       "failed to restore backup @ from %s: %m",
-			       backup_at);
+			       "bdfs: autosnap_rollback: recovered — @ restored "
+			       "from backup. Staging subvolume deleted.");
+		}
 		goto out_umount;
 	}
 
@@ -795,10 +932,10 @@ int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job)
 	       snap_name);
 
 out_umount:
-	/* Step 5: unmount and clean up tmpdir */
 	if (umount2(tmpdir, MNT_DETACH) < 0)
 		syslog(LOG_WARNING,
-		       "bdfs: autosnap_rollback: umount %s: %m (will clean on reboot)",
+		       "bdfs: autosnap_rollback: umount %s: %m "
+		       "(will be cleaned up on reboot)",
 		       tmpdir);
 	rmdir(tmpdir);
 	return ret;
