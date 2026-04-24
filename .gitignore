@@ -28,3 +28,4 @@ CTestTestfile.cmake
 
 # Test artefacts
 /tmp/bdfs_*
+.npmrc
