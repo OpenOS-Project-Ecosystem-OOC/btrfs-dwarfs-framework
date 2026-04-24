@@ -180,7 +180,8 @@ btrfs-dwarfs-framework/
 └── integrations/                 # Git submodules — external projects that integrate with bdfs
     ├── frzr-meta-root/           # Immutable root manager (frzr + ABRoot v2, Incus backend)
     ├── btr-fs-git/               # Git-like workflow for btrfs subvolumes (BFG)
-    └── btrfs-assistant/          # Qt6 GUI with BDFS tab for daemon interaction
+    ├── btrfs-assistant/          # Qt6 GUI with BDFS tab for daemon interaction
+    └── ashos/                    # Immutable tree-shaped meta-distribution (AshOS)
 ```
 
 ---
@@ -543,6 +544,26 @@ A Qt6 GUI for btrfs filesystem management. Includes a **BDFS tab** (`src/ui/Bdfs
 - Pruning snapshots with keep-N policy, name pattern filter, demote-before-delete, and dry-run mode
 
 The BDFS tab disables itself gracefully when the daemon is not running.
+
+### ashos ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/ashos))
+
+AshOS is a distro-agnostic immutable meta-distribution that wraps any bootstrappable Linux distribution (Arch, Debian, Fedora, Alpine, etc.) with a tree-shaped btrfs snapshot hierarchy. Each snapshot is a full read-only subvolume; package installation happens by chrooting into a snapshot, then deploying it as the next boot target.
+
+Integrates with bdfs via `src/bdfs_hook.py`, which monkey-patches `delete_node()` to demote each snapshot's rootfs subvolume to a DwarFS archive before the btrfs subvolume is deleted. Old OS states become recoverable compressed archives rather than being discarded.
+
+**Enabling the hook** (disabled by default):
+
+```ini
+# /etc/bdfs/bdfs.conf
+[ashos]
+demote_on_delete = true
+archive_dir = /var/lib/bdfs/archives/ashos
+compression = zstd
+```
+
+Or set `BDFS_DEMOTE_ON_DELETE=1` in the environment. If bdfs is absent or the demote fails, ash falls back to plain `btrfs subvolume delete` — no snapshot is ever lost due to a bdfs failure.
+
+> **Note:** AshOS is licensed AGPLv3. Integration is at the subprocess boundary (`ash` calls `bdfs` as a CLI tool) — no shared linking, no license conflict.
 
 ---
 

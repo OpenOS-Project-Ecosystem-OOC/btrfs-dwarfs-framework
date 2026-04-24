@@ -7,3 +7,6 @@
 [submodule "integrations/btrfs-assistant"]
 	path = integrations/btrfs-assistant
 	url = https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btrfs-assistant.git
+[submodule "integrations/ashos"]
+	path = integrations/ashos
+	url = https://gitlab.com/openos-project/linux-kernel_filesystem_deving/ashos.git
