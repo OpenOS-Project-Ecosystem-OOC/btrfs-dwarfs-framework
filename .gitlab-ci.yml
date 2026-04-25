@@ -7,6 +7,10 @@ stages:
   - integration
   - build
 
+# The integration-test job requires a privileged runner tagged "privileged".
+# See ci/runner-config.toml for the registration command and config template.
+# Without a privileged runner the job is allowed to fail (allow_failure: true).
+
 default:
   image: ubuntu:22.04
 
@@ -71,10 +75,6 @@ autosnap-makefile-check:
 
 integration-test:
   stage: integration
-  # Privileged mode is required for loopback device creation (losetup) and
-  # BTRFS/FUSE mounts. The runner must have privileged: true in its config.
-  # allow_failure: true so the MR is not blocked when no privileged runner
-  # is available — the job will still appear as a warning in the pipeline.
   allow_failure: true
   tags:
     - privileged
@@ -82,13 +82,7 @@ integration-test:
   before_script:
     - apt-get update -qq
     - apt-get install -y --no-install-recommends
-        btrfs-progs
-        fuse3
-        fuse-overlayfs
-        curl
-        xz-utils
-        sqlite3
-    # Install DwarFS universal binary (mkdwarfs, dwarfs, dwarfsextract)
+        btrfs-progs fuse3 fuse-overlayfs curl xz-utils sqlite3
     - |
       DWARFS_VERSION=0.10.2
       curl -fsSL \
@@ -101,7 +95,6 @@ integration-test:
       ln -sf dwarfs-universal /usr/local/bin/dwarfsextract
       ln -sf dwarfs-universal /usr/local/bin/dwarfsck
       rm -rf /tmp/dwarfs.tar.xz /tmp/dwarfs-universal-*
-    # Install Kubo (IPFS) for the IPFS pinning integration test
     - |
       KUBO_VERSION=0.29.0
       curl -fsSL \

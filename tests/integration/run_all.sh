@@ -120,7 +120,8 @@ for suite in \
     "$SCRIPT_DIR/test_blend_layer.sh" \
     "$SCRIPT_DIR/test_snapshot_lifecycle.sh" \
     "$SCRIPT_DIR/test_workspace_hooks.sh" \
-    "$SCRIPT_DIR/test_ipfs_pin.sh"
+    "$SCRIPT_DIR/test_ipfs_pin.sh" \
+    "$SCRIPT_DIR/test_workspace_health_check.sh"
 do
     if [[ -f "$suite" ]]; then
         run_suite "$suite"
