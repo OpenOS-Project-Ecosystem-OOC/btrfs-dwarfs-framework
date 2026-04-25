@@ -32,20 +32,29 @@ struct bdfs_daemon_config {
 	char dwarfsextract_bin[256];
 	char dwarfsck_bin[256];
 	/*
-	 * mkdwarfs_timeout_s — maximum seconds bdfs_exec_mkdwarfs will wait
-	 * before sending SIGTERM then SIGKILL to the mkdwarfs child process.
-	 * 0 = use the compiled-in default (2700 s = 45 min).
-	 * Set via bdfs.conf: mkdwarfs_timeout = <seconds>
+	 * mkdwarfs_timeout_s — max seconds for a mkdwarfs child before
+	 * SIGTERM then SIGKILL. 0 = compiled-in default (2700 s = 45 min).
+	 * Set via bdfs.conf [daemon] mkdwarfs_timeout = <seconds>
 	 */
-	int mkdwarfs_timeout_s;
-
+	int  mkdwarfs_timeout_s;
 	/*
-	 * shutdown_log_path — path to the append-only JSONL file where
-	 * workspace shutdown events are recorded.
-	 * Default: /var/log/bdfs/workspace-shutdown.jsonl
-	 * Set via bdfs.conf: shutdown_log = <path>
+	 * shutdown_log_path — append-only JSONL file for workspace shutdown
+	 * events. Default: /var/log/bdfs/workspace-shutdown.jsonl
+	 * Set via bdfs.conf [daemon] shutdown_log = <path>
 	 */
 	char shutdown_log_path[256];
+	/*
+	 * pin_helper_bin — path to bdfs-pin-helper binary.
+	 * When empty the daemon searches $PATH for "bdfs-pin-helper".
+	 * Set via bdfs.conf [tools] pin_helper = <path>
+	 */
+	char pin_helper_bin[256];
+	/*
+	 * kubo_api — Kubo HTTP RPC API base URL used by bdfs-pin-helper.
+	 * Default: http://127.0.0.1:5001
+	 * Set via bdfs.conf [daemon] kubo_api = <url>
+	 */
+	char kubo_api[256];
 	char btrfs_bin[256];
 	/*
 	 * fuse-overlayfs binary used for the userspace blend fallback.
@@ -91,6 +100,7 @@ enum bdfs_job_type {
 	 * A reboot is required for the new @ to take effect.
 	 */
 	BDFS_JOB_AUTOSNAP_ROLLBACK,
+	BDFS_JOB_WORKSPACE_SHUTDOWN,
 };
 
 /* A unit of work dispatched to the thread pool */
@@ -217,6 +227,18 @@ struct bdfs_job {
 #define BDFS_PRUNE_DRY_RUN      (1 << 1) /* log but do not delete */
 			uint32_t demote_compression;
 		} prune;
+
+		struct {
+			char     workspace_path[BDFS_PATH_MAX];
+			uint32_t reason;
+#define BDFS_WS_SHUTDOWN_PAUSE  0
+#define BDFS_WS_SHUTDOWN_DELETE 1
+#define BDFS_WS_SHUTDOWN_STOP   2
+			uint32_t compression;
+			uint32_t prune_keep;
+			char     image_path[BDFS_PATH_MAX];
+			char     archive_cid[256]; /* populated after IPFS pin */
+		} workspace_shutdown;
 
 		/*
 		 * autosnap_rollback: roll back the root btrfs subvolume (@)
@@ -358,6 +380,17 @@ int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_mount_blend_userspace(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_prune(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job);
+int bdfs_job_workspace_shutdown(struct bdfs_daemon *d, struct bdfs_job *job);
+int bdfs_exec_wait_timeout(const char *const argv[], int timeout_s);
+/*
+ * bdfs_exec_capture_output - fork+exec argv[], capture stdout into buf.
+ *
+ * Like bdfs_exec_wait_timeout but stdout is piped back to the caller.
+ * At most bufsz-1 bytes are stored; buf is always NUL-terminated.
+ * Returns 0 on success, -ETIMEDOUT on timeout, -errno / -EIO on error.
+ */
+int bdfs_exec_capture_output(const char *const argv[], int timeout_s,
+			     char *buf, size_t bufsz);
 
 /* mount table helpers */
 void bdfs_mount_track(struct bdfs_daemon *d, enum bdfs_mount_type type,
@@ -393,7 +426,6 @@ void bdfs_socket_loop(struct bdfs_daemon *d);
 
 /* tool execution helpers (bdfs_exec.c) */
 int bdfs_exec_wait(const char *const argv[]);
-int bdfs_exec_wait_timeout(const char *const argv[], int timeout_s);
 int bdfs_exec_mkdwarfs(struct bdfs_daemon *d, const char *input_dir,
 		       const char *output_image, uint32_t compression,
 		       uint32_t block_size_bits, int worker_threads);

@@ -4,12 +4,8 @@
 stages:
   - secret-scan
   - test
-  - integration
   - build
-
-# The integration-test job requires a privileged runner tagged "privileged".
-# See ci/runner-config.toml for the registration command and config template.
-# Without a privileged runner the job is allowed to fail (allow_failure: true).
+  - integration-test
 
 default:
   image: ubuntu:22.04
@@ -73,49 +69,6 @@ autosnap-makefile-check:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
 
-integration-test:
-  stage: integration
-  allow_failure: true
-  tags:
-    - privileged
-  image: ubuntu:22.04
-  before_script:
-    - apt-get update -qq
-    - apt-get install -y --no-install-recommends
-        btrfs-progs fuse3 fuse-overlayfs curl xz-utils sqlite3
-    - |
-      DWARFS_VERSION=0.10.2
-      curl -fsSL \
-        "https://github.com/mhx/dwarfs/releases/download/v${DWARFS_VERSION}/dwarfs-universal-${DWARFS_VERSION}-Linux-x86_64.tar.xz" \
-        -o /tmp/dwarfs.tar.xz
-      tar -xf /tmp/dwarfs.tar.xz -C /tmp
-      install -m 0755 /tmp/dwarfs-universal-*/dwarfs-universal /usr/local/bin/dwarfs-universal
-      ln -sf dwarfs-universal /usr/local/bin/mkdwarfs
-      ln -sf dwarfs-universal /usr/local/bin/dwarfs
-      ln -sf dwarfs-universal /usr/local/bin/dwarfsextract
-      ln -sf dwarfs-universal /usr/local/bin/dwarfsck
-      rm -rf /tmp/dwarfs.tar.xz /tmp/dwarfs-universal-*
-    - |
-      KUBO_VERSION=0.29.0
-      curl -fsSL \
-        "https://dist.ipfs.tech/kubo/v${KUBO_VERSION}/kubo_v${KUBO_VERSION}_linux-amd64.tar.gz" \
-        -o /tmp/kubo.tar.gz
-      tar -xf /tmp/kubo.tar.gz -C /tmp
-      install -m 0755 /tmp/kubo/ipfs /usr/local/bin/ipfs
-      rm -rf /tmp/kubo.tar.gz /tmp/kubo
-  script:
-    - bash tests/integration/run_all.sh
-  artifacts:
-    when: always
-    paths:
-      - tests/integration/results/
-    reports:
-      junit: tests/integration/results/junit.xml
-    expire_in: 14 days
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
-
 build:
   stage: build
   before_script:
@@ -126,6 +79,21 @@ build:
     - make || true
   artifacts:
     paths: [build/]
+    expire_in: 7 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+build-pin-helper:
+  stage: build
+  image: golang:1.21-bookworm
+  script:
+    - cd tools/bdfs-pin-helper
+    - go mod tidy
+    - go build -o bdfs-pin-helper .
+    - go vet ./...
+  artifacts:
+    paths: [tools/bdfs-pin-helper/bdfs-pin-helper]
     expire_in: 7 days
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

@@ -3,6 +3,7 @@ build/
 *.o
 *.ko
 *.mod
+!go.mod
 *.mod.c
 *.mod.o
 *.symvers
