@@ -1,4 +1,4 @@
-module gitlab.com/openos-project/linux-kernel_filesystem_deving/btrfs-dwarfs-framework/ipfs/dwarfs-pin
+module gitlab.com/openos-project/git-management_deving/gitlab-enhanced/ipfs/dwarfs-pin
 
 go 1.21
 

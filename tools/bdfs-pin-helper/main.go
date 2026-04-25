@@ -31,7 +31,7 @@ import (
 	"os"
 	"time"
 
-	dwarfspin "gitlab.com/openos-project/linux-kernel_filesystem_deving/btrfs-dwarfs-framework/ipfs/dwarfs-pin"
+	dwarfspin "gitlab.com/openos-project/git-management_deving/gitlab-enhanced/ipfs/dwarfs-pin"
 )
 
 func main() {
