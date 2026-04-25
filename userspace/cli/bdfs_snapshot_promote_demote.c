@@ -33,11 +33,15 @@
 
 /* ── bdfs snapshot ───────────────────────────────────────────────────────── */
 
+int cmd_snapshot_status(struct bdfs_cli *cli, int argc, char *argv[]);
+
 int cmd_snapshot(struct bdfs_cli *cli, int argc, char *argv[])
 {
-	/* If first arg is "prune", delegate */
+	/* Delegate sub-subcommands */
 	if (argc > 0 && strcmp(argv[0], "prune") == 0)
 		return cmd_snapshot_prune(cli, argc - 1, argv + 1);
+	if (argc > 0 && strcmp(argv[0], "status") == 0)
+		return cmd_snapshot_status(cli, argc - 1, argv + 1);
 
 	struct bdfs_ioctl_snapshot_dwarfs_container arg;
 	int opt;
@@ -70,7 +74,9 @@ int cmd_snapshot(struct bdfs_cli *cli, int argc, char *argv[])
 			printf("Usage: bdfs snapshot --partition <uuid> "
 			       "--name <name> [--readonly]\n"
 			       "       bdfs snapshot prune --partition <uuid> "
-			       "--btrfs-mount <path> --keep <n> [OPTIONS]\n");
+			       "--btrfs-mount <path> --keep <n> [OPTIONS]\n"
+			       "       bdfs snapshot status --btrfs-mount <path> "
+			       "[--pattern <glob>] [-j]\n");
 			return 0;
 		default: return 1;
 		}
@@ -272,6 +278,181 @@ int cmd_promote(struct bdfs_cli *cli, int argc, char *argv[])
 		printf("{\"status\":0,\"subvol_id\":%llu}\n",
 		       (unsigned long long)arg.subvol_id_out);
 	return 0;
+}
+
+/* ── bdfs snapshot status ────────────────────────────────────────────────── */
+/*
+ * bdfs snapshot status --btrfs-mount <path> [--pattern <glob>] [-j]
+ *
+ * Lists workspace snapshots under btrfs-mount matching pattern (default:
+ * "ws-snap-*"), sorted newest-first.  Reports the most recent snapshot name,
+ * total count, and whether a DwarFS archive exists alongside the workspace.
+ *
+ * Exit codes:
+ *   0  at least one snapshot found
+ *   1  no snapshots found (or error)
+ */
+
+#include <dirent.h>
+#include <fnmatch.h>
+#include <sys/stat.h>
+#include <time.h>
+
+/* One snapshot entry */
+struct snap_entry {
+	char   name[BDFS_NAME_MAX + 1];
+	time_t mtime;
+};
+
+static int snap_cmp_newest(const void *a, const void *b)
+{
+	const struct snap_entry *sa = a, *sb = b;
+	/* Descending by mtime */
+	if (sb->mtime > sa->mtime) return  1;
+	if (sb->mtime < sa->mtime) return -1;
+	return 0;
+}
+
+int cmd_snapshot_status(struct bdfs_cli *cli, int argc, char *argv[])
+{
+	char btrfs_mount[BDFS_PATH_MAX] = "";
+	char pattern[256] = "ws-snap-*";
+	int opt;
+
+	static const struct option opts[] = {
+		{ "btrfs-mount", required_argument, NULL, 'm' },
+		{ "pattern",     required_argument, NULL, 'P' },
+		{ "help",        no_argument,       NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+
+	while ((opt = getopt_long(argc, argv, "m:P:h", opts, NULL)) != -1) {
+		switch (opt) {
+		case 'm':
+			strncpy(btrfs_mount, optarg, sizeof(btrfs_mount) - 1);
+			break;
+		case 'P':
+			strncpy(pattern, optarg, sizeof(pattern) - 1);
+			break;
+		case 'h':
+			printf("Usage: bdfs snapshot status "
+			       "--btrfs-mount <path> [--pattern <glob>]\n"
+			       "\n"
+			       "Lists workspace snapshots matching <glob> "
+			       "(default: ws-snap-*) under <path>,\n"
+			       "sorted newest-first. Reports the most recent "
+			       "snapshot and total count.\n");
+			return 0;
+		default:
+			return 1;
+		}
+	}
+
+	if (btrfs_mount[0] == '\0') {
+		bdfs_err("--btrfs-mount is required");
+		return 1;
+	}
+
+	/* Scan the directory for matching entries */
+	DIR *dir = opendir(btrfs_mount);
+	if (!dir) {
+		bdfs_err("opendir %s: %s", btrfs_mount, strerror(errno));
+		return 1;
+	}
+
+	struct snap_entry *snaps = NULL;
+	uint32_t count = 0, cap = 0;
+
+	struct dirent *de;
+	while ((de = readdir(dir)) != NULL) {
+		if (fnmatch(pattern, de->d_name, 0) != 0)
+			continue;
+
+		/* stat to get mtime */
+		char full[BDFS_PATH_MAX];
+		snprintf(full, sizeof(full), "%s/%s", btrfs_mount, de->d_name);
+		struct stat st;
+		if (stat(full, &st) < 0)
+			continue;
+
+		if (count >= cap) {
+			cap = cap ? cap * 2 : 16;
+			struct snap_entry *tmp =
+				realloc(snaps, cap * sizeof(*snaps));
+			if (!tmp) {
+				bdfs_err("out of memory");
+				free(snaps);
+				closedir(dir);
+				return 1;
+			}
+			snaps = tmp;
+		}
+
+		strncpy(snaps[count].name, de->d_name,
+			sizeof(snaps[count].name) - 1);
+		snaps[count].name[sizeof(snaps[count].name) - 1] = '\0';
+		snaps[count].mtime = st.st_mtime;
+		count++;
+	}
+	closedir(dir);
+
+	/* Sort newest-first */
+	if (count > 0)
+		qsort(snaps, count, sizeof(*snaps), snap_cmp_newest);
+
+	/* Check for a DwarFS archive alongside the workspace */
+	char archive_path[BDFS_PATH_MAX];
+	snprintf(archive_path, sizeof(archive_path),
+		 "%s.dwarfs", btrfs_mount);
+	bool archive_exists = (access(archive_path, F_OK) == 0);
+
+	if (cli->json_output) {
+		printf("{\"snapshot_count\":%u", count);
+		if (count > 0) {
+			char ts[32];
+			struct tm *tm = localtime(&snaps[0].mtime);
+			strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tm);
+			printf(",\"latest\":\"%s\",\"latest_mtime\":\"%s\"",
+			       snaps[0].name, ts);
+		} else {
+			printf(",\"latest\":null,\"latest_mtime\":null");
+		}
+		printf(",\"archive_exists\":%s,\"archive_path\":\"%s\"}\n",
+		       archive_exists ? "true" : "false",
+		       archive_path);
+	} else {
+		printf("Workspace snapshot status\n");
+		printf("  Mount:     %s\n", btrfs_mount);
+		printf("  Pattern:   %s\n", pattern);
+		printf("  Snapshots: %u\n", count);
+		if (count > 0) {
+			char ts[32];
+			struct tm *tm = localtime(&snaps[0].mtime);
+			strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+			printf("  Latest:    %s  (%s)\n",
+			       snaps[0].name, ts);
+			if (count > 1) {
+				printf("  All snapshots (newest first):\n");
+				for (uint32_t i = 0; i < count; i++) {
+					char ts2[32];
+					struct tm *tm2 =
+						localtime(&snaps[i].mtime);
+					strftime(ts2, sizeof(ts2),
+						 "%Y-%m-%d %H:%M:%S", tm2);
+					printf("    [%u] %s  (%s)\n",
+					       i, snaps[i].name, ts2);
+				}
+			}
+		} else {
+			printf("  Latest:    (none)\n");
+		}
+		printf("  Archive:   %s%s\n",
+		       archive_exists ? archive_path : "(none)",
+		       archive_exists ? "" : "");
+	}
+
+	free(snaps);
+	return (count > 0) ? 0 : 1;
 }
 
 /* ── bdfs demote ─────────────────────────────────────────────────────────── */

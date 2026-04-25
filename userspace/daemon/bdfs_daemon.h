@@ -76,6 +76,18 @@ enum bdfs_job_type {
 	 * A reboot is required for the new @ to take effect.
 	 */
 	BDFS_JOB_AUTOSNAP_ROLLBACK,
+
+	/*
+	 * Workspace shutdown hook: run bdfs lifecycle operations before a
+	 * workspace container is stopped.
+	 *
+	 * Reason BDFS_WS_SHUTDOWN_PAUSE  → btrfs snapshot (bfg local_commit)
+	 * Reason BDFS_WS_SHUTDOWN_DELETE → bdfs demote to DwarFS archive
+	 * Reason BDFS_WS_SHUTDOWN_STOP   → no-op
+	 *
+	 * Failures are logged but do not prevent the workspace from stopping.
+	 */
+	BDFS_JOB_WORKSPACE_SHUTDOWN,
 };
 
 /* A unit of work dispatched to the thread pool */
@@ -202,6 +214,29 @@ struct bdfs_job {
 #define BDFS_PRUNE_DRY_RUN      (1 << 1) /* log but do not delete */
 			uint32_t demote_compression;
 		} prune;
+
+		/*
+		 * workspace_shutdown: run bdfs lifecycle hooks before a
+		 * workspace container is stopped.
+		 *
+		 * workspace_path  - root of the workspace BTRFS subvolume
+		 * reason          - BDFS_WS_SHUTDOWN_PAUSE / _DELETE / _STOP
+		 * compression     - algorithm for demote (BDFS_WS_SHUTDOWN_DELETE)
+		 * prune_keep      - snapshots to retain after pause (0 = skip)
+		 * image_path      - destination .dwarfs path for demote
+		 *                   (auto-derived as workspace_path + ".dwarfs"
+		 *                    when empty)
+		 */
+		struct {
+			char     workspace_path[BDFS_PATH_MAX];
+			uint32_t reason;
+#define BDFS_WS_SHUTDOWN_PAUSE  0  /* snapshot on pause */
+#define BDFS_WS_SHUTDOWN_DELETE 1  /* demote on delete  */
+#define BDFS_WS_SHUTDOWN_STOP   2  /* no-op             */
+			uint32_t compression;  /* enum bdfs_dwarfs_compression */
+			uint32_t prune_keep;   /* 0 = no prune after snapshot  */
+			char     image_path[BDFS_PATH_MAX]; /* "" = auto-derive */
+		} workspace_shutdown;
 
 		/*
 		 * autosnap_rollback: roll back the root btrfs subvolume (@)
@@ -343,6 +378,7 @@ int bdfs_job_promote_copyup(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_mount_blend_userspace(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_prune(struct bdfs_daemon *d, struct bdfs_job *job);
 int bdfs_job_autosnap_rollback(struct bdfs_daemon *d, struct bdfs_job *job);
+int bdfs_job_workspace_shutdown(struct bdfs_daemon *d, struct bdfs_job *job);
 
 /* mount table helpers */
 void bdfs_mount_track(struct bdfs_daemon *d, enum bdfs_mount_type type,
