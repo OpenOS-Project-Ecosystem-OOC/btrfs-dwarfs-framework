@@ -34,6 +34,7 @@ int cmd_blend_umount(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_snapshot(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_promote(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_demote(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_fetch(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_status(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_verify(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_setup(struct bdfs_cli *cli, int argc, char *argv[]);
@@ -79,6 +80,8 @@ static const struct bdfs_command COMMANDS[] = {
 	  "Manage package-manager snapshots (list, delete, rollback, status, prune)" },
 	{ "workspace-shutdown", NULL, cmd_workspace_shutdown,
 	  "Send workspace lifecycle hook to daemon (pause|delete|stop)" },
+	{ "fetch",     NULL,     cmd_fetch,
+	  "Restore a workspace snapshot from an IPFS CID" },
 };
 
 /* blend is a sub-namespace: `bdfs blend mount` / `bdfs blend umount` */

@@ -106,6 +106,7 @@ if(BUILD_CLI)
         cli/bdfs_export_import.c
         cli/bdfs_mount.c
         cli/bdfs_snapshot_promote_demote.c
+        cli/bdfs_fetch.c
         cli/bdfs_status.c
         cli/bdfs_verify.c
         cli/bdfs_policy.c
@@ -245,6 +246,12 @@ if(BUILD_GITLAB_ENHANCED)
         message(STATUS "gitlab-enhanced integration: enabled (go=${GO_EXECUTABLE})")
     endif()
 endif()
+
+# ── Man pages ────────────────────────────────────────────────────────────────
+install(FILES
+    "${CMAKE_SOURCE_DIR}/../doc/bdfs.conf.5"
+    DESTINATION share/man/man5
+)
 
 # ── Unit tests ───────────────────────────────────────────────────────────────
 if(BUILD_TESTS)
