@@ -64,6 +64,81 @@ int bdfs_exec_wait(const char *const argv[])
 	return -EIO;
 }
 
+/*
+ * bdfs_exec_wait_timeout - Fork, exec argv[], and wait up to timeout_s seconds.
+ *
+ * Polls with WNOHANG every 500 ms. If the child has not exited by the
+ * deadline, sends SIGTERM, waits 5 seconds, then sends SIGKILL.
+ *
+ * Returns:
+ *   0        child exited successfully
+ *   -ETIMEDOUT  child killed due to timeout
+ *   -errno   fork failure or waitpid error
+ *   -EIO     child exited with non-zero status or killed by signal
+ */
+int bdfs_exec_wait_timeout(const char *const argv[], int timeout_s)
+{
+	pid_t pid;
+	int   status;
+	int   elapsed_ms = 0;
+	const int poll_ms = 500;
+	const int sigterm_grace_ms = 5000;
+
+	pid = fork();
+	if (pid < 0)
+		return -errno;
+
+	if (pid == 0) {
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+
+	/* Poll until done or deadline */
+	while (elapsed_ms < timeout_s * 1000) {
+		struct timespec ts = { .tv_sec = 0,
+				       .tv_nsec = poll_ms * 1000000L };
+		nanosleep(&ts, NULL);
+		elapsed_ms += poll_ms;
+
+		pid_t r = waitpid(pid, &status, WNOHANG);
+		if (r < 0)
+			return -errno;
+		if (r > 0) {
+			if (WIFEXITED(status))
+				return WEXITSTATUS(status) == 0 ? 0 : -EIO;
+			return -EIO; /* killed by signal */
+		}
+	}
+
+	/* Deadline exceeded — SIGTERM then SIGKILL */
+	syslog(LOG_WARNING,
+	       "bdfs: exec timeout (%ds) — sending SIGTERM to pid %d",
+	       timeout_s, (int)pid);
+	kill(pid, SIGTERM);
+
+	for (int grace = 0; grace < sigterm_grace_ms; grace += poll_ms) {
+		struct timespec ts = { .tv_sec = 0,
+				       .tv_nsec = poll_ms * 1000000L };
+		nanosleep(&ts, NULL);
+		pid_t r = waitpid(pid, &status, WNOHANG);
+		if (r > 0)
+			return -ETIMEDOUT; /* exited after SIGTERM */
+	}
+
+	syslog(LOG_ERR,
+	       "bdfs: exec SIGTERM ignored — sending SIGKILL to pid %d",
+	       (int)pid);
+	kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	return -ETIMEDOUT;
+}
+
 /* ── mkdwarfs ───────────────────────────────────────────────────────────── */
 
 /*
@@ -103,9 +178,26 @@ int bdfs_exec_mkdwarfs(struct bdfs_daemon *d, const char *input_dir,
 	argv[i++] = "--categorize";
 	argv[i++] = NULL;
 
-	syslog(LOG_INFO, "bdfs: mkdwarfs %s → %s (compression=%s)",
-	       input_dir, output_image, compression_name(compression));
-	return bdfs_exec_wait(argv);
+	/*
+	 * Use bdfs_exec_wait_timeout so a stalled mkdwarfs process cannot
+	 * block the daemon worker thread indefinitely.  The timeout comes from
+	 * cfg.mkdwarfs_timeout_s (default: 2700 s = 45 min), matching the
+	 * systemd unit's TimeoutStartSec.  A zero value falls back to the
+	 * unbounded bdfs_exec_wait for callers that do not set the field.
+	 */
+	int timeout_s = d->cfg.mkdwarfs_timeout_s > 0
+			? d->cfg.mkdwarfs_timeout_s
+			: 2700;
+
+	syslog(LOG_INFO, "bdfs: mkdwarfs %s → %s (compression=%s, timeout=%ds)",
+	       input_dir, output_image, compression_name(compression), timeout_s);
+
+	int ret = bdfs_exec_wait_timeout(argv, timeout_s);
+	if (ret == -ETIMEDOUT)
+		syslog(LOG_ERR,
+		       "bdfs: mkdwarfs timed out after %ds for %s",
+		       timeout_s, input_dir);
+	return ret;
 }
 
 /* ── dwarfsextract ──────────────────────────────────────────────────────── */

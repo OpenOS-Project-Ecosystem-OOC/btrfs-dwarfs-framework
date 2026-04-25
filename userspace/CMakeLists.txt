@@ -59,6 +59,7 @@ if(BUILD_DAEMON)
         daemon/bdfs_exec.c
         daemon/bdfs_jobs.c
         daemon/bdfs_jobs_workspace.c
+        daemon/bdfs_shutdown_log.c
         daemon/bdfs_netlink.c
         daemon/bdfs_socket.c
         daemon/bdfs_policy.c
@@ -93,6 +94,11 @@ if(BUILD_DAEMON)
         ${CMAKE_SOURCE_DIR}/../configs/bdfs-workspace-shutdown@.service
         DESTINATION lib/systemd/system
         OPTIONAL
+    )
+
+    install(PROGRAMS
+        ${CMAKE_SOURCE_DIR}/../tools/workspace-health-check
+        DESTINATION bin
     )
 
     # Default daemon config

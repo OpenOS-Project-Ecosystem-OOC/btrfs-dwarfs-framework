@@ -621,6 +621,83 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 				 "\"policy engine not running\"}\n");
 		}
 
+	} else if (strstr(req, "\"cmd\":\"workspace_shutdown\"")) {
+		/*
+		 * Enqueue a BDFS_JOB_WORKSPACE_SHUTDOWN job.
+		 *
+		 * Request fields:
+		 *   workspace_path  (string, required)
+		 *   reason          (string: "pause"|"delete"|"stop")
+		 *   compression     (string: "zstd"|"lzma"|"lz4"|"brotli"|"none")
+		 *   prune_keep      (int, 0 = no prune)
+		 *   image_path      (string, "" = auto-derive)
+		 */
+		char ws_path[BDFS_PATH_MAX]    = {0};
+		char reason_str[32]            = {0};
+		char compression_str[32]       = {0};
+		char image_path[BDFS_PATH_MAX] = {0};
+		int  prune_keep = int_field(req, "prune_keep");
+
+		str_field(req, "workspace_path", ws_path,         sizeof(ws_path));
+		str_field(req, "reason",         reason_str,      sizeof(reason_str));
+		str_field(req, "compression",    compression_str, sizeof(compression_str));
+		str_field(req, "image_path",     image_path,      sizeof(image_path));
+
+		if (!ws_path[0]) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":"
+				 "\"workspace_path is required\"}\n");
+			goto send;
+		}
+
+		/* Map reason string to numeric constant */
+		uint32_t reason_code;
+		if (strcmp(reason_str, "pause") == 0)
+			reason_code = BDFS_WS_SHUTDOWN_PAUSE;
+		else if (strcmp(reason_str, "delete") == 0)
+			reason_code = BDFS_WS_SHUTDOWN_DELETE;
+		else if (strcmp(reason_str, "stop") == 0 || reason_str[0] == '\0')
+			reason_code = BDFS_WS_SHUTDOWN_STOP;
+		else {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-22,\"error\":"
+				 "\"reason must be pause, delete, or stop\"}\n");
+			goto send;
+		}
+
+		/* Map compression string to enum value */
+		uint32_t comp = BDFS_COMPRESS_ZSTD; /* default */
+		if (strcmp(compression_str, "lzma")   == 0) comp = BDFS_COMPRESS_LZMA;
+		else if (strcmp(compression_str, "lz4")    == 0) comp = BDFS_COMPRESS_LZ4;
+		else if (strcmp(compression_str, "brotli") == 0) comp = BDFS_COMPRESS_BROTLI;
+		else if (strcmp(compression_str, "none")   == 0) comp = BDFS_COMPRESS_NONE;
+
+		struct bdfs_job *job = bdfs_job_alloc(BDFS_JOB_WORKSPACE_SHUTDOWN);
+		if (!job) {
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":-12,\"error\":\"out of memory\"}\n");
+			goto send;
+		}
+
+		strncpy(job->workspace_shutdown.workspace_path,
+			ws_path, BDFS_PATH_MAX - 1);
+		strncpy(job->workspace_shutdown.image_path,
+			image_path, BDFS_PATH_MAX - 1);
+		job->workspace_shutdown.reason      = reason_code;
+		job->workspace_shutdown.compression = comp;
+		job->workspace_shutdown.prune_keep  = (uint32_t)(prune_keep > 0 ? prune_keep : 0);
+
+		int r = bdfs_daemon_enqueue(d, job);
+		if (r == 0)
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":\"ok\",\"data\":{"
+				 "\"workspace_path\":\"%s\","
+				 "\"reason\":\"%s\"}}\n",
+				 ws_path, reason_str[0] ? reason_str : "stop");
+		else
+			snprintf(resp, sizeof(resp),
+				 "{\"status\":%d,\"error\":\"enqueue failed\"}\n", r);
+
 	} else if (strstr(req, "\"cmd\":\"ping\"") ||
 		   strstr(req, "\"ping\"")) {
 		snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"data\":\"pong\"}\n");

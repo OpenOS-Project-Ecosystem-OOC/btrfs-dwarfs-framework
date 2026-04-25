@@ -31,6 +31,16 @@
 #include <unistd.h>
 
 #include "bdfs_daemon.h"
+#include "bdfs_shutdown_log.h"
+
+/* Milliseconds elapsed since start_ts (struct timespec) */
+static long long elapsed_ms(const struct timespec *start)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long long)(now.tv_sec  - start->tv_sec)  * 1000
+	     + (long long)(now.tv_nsec - start->tv_nsec) / 1000000;
+}
 
 /* Maximum time (seconds) allowed for a workspace demote operation.
  * Large workspaces on slow disks can take tens of minutes to compress. */
@@ -89,21 +99,37 @@ static int workspace_do_pause(struct bdfs_daemon *d,
 {
 	const char *ws = job->workspace_shutdown.workspace_path;
 	char snap_path[BDFS_PATH_MAX];
-	int ret;
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 
 	snapshot_path_for_pause(ws, snap_path, sizeof(snap_path));
-
 	syslog(LOG_INFO, "bdfs: workspace pause: snapshotting %s → %s",
 	       ws, snap_path);
 
-	ret = bdfs_exec_btrfs_snapshot(d, ws, snap_path, /*readonly=*/true);
+	int ret = bdfs_exec_btrfs_snapshot(d, ws, snap_path, /*readonly=*/true);
+
+	/* Log the event regardless of outcome */
+	struct bdfs_shutdown_event ev = {0};
+	ev.timestamp = time(NULL);
+	ev.reason    = BDFS_WS_SHUTDOWN_PAUSE;
+	ev.duration_ms = elapsed_ms(&t0);
+	strncpy(ev.workspace_path, ws, BDFS_PATH_MAX - 1);
+	strncpy(ev.archive_path, snap_path, BDFS_PATH_MAX - 1);
+
 	if (ret) {
+		ev.outcome = (ret == -ETIMEDOUT)
+			     ? BDFS_SHUTDOWN_TIMEOUT : BDFS_SHUTDOWN_ERROR;
+		snprintf(ev.error_msg, sizeof(ev.error_msg),
+			 "btrfs snapshot failed: %d", ret);
+		bdfs_shutdown_log_write(d, &ev);
 		syslog(LOG_WARNING,
 		       "bdfs: workspace pause: snapshot failed (non-fatal): %d",
 		       ret);
 		return ret;
 	}
 
+	ev.outcome = BDFS_SHUTDOWN_OK;
+	bdfs_shutdown_log_write(d, &ev);
 	syslog(LOG_INFO, "bdfs: workspace pause: snapshot complete → %s",
 	       snap_path);
 
@@ -114,10 +140,9 @@ static int workspace_do_pause(struct bdfs_daemon *d,
 		if (!prune_job) {
 			syslog(LOG_WARNING,
 			       "bdfs: workspace pause: prune alloc failed (non-fatal)");
-			return 0; /* snapshot succeeded; prune failure is non-fatal */
+			return 0;
 		}
 
-		/* Derive parent directory of the workspace subvolume */
 		char parent[BDFS_PATH_MAX];
 		snprintf(parent, sizeof(parent), "%s", ws);
 		char *slash = strrchr(parent, '/');
@@ -153,25 +178,19 @@ static int workspace_do_delete(struct bdfs_daemon *d,
 {
 	const char *ws = job->workspace_shutdown.workspace_path;
 	char image_path[BDFS_PATH_MAX];
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 
 	derive_image_path(job, image_path, sizeof(image_path));
-
 	syslog(LOG_INFO,
 	       "bdfs: workspace delete: demoting %s → %s (compression=%u)",
 	       ws, image_path, job->workspace_shutdown.compression);
 
 	/*
-	 * Call bdfs_exec_mkdwarfs directly on the workspace path.
-	 *
-	 * We do not go through BDFS_JOB_EXPORT_TO_DWARFS because that path
-	 * uses btrfs-send | mkdwarfs piped import, which requires a valid
-	 * subvol_id and a registered partition — neither of which is
-	 * guaranteed for an arbitrary workspace subvolume path.
-	 *
-	 * bdfs_exec_mkdwarfs runs mkdwarfs -i <ws> -o <image> directly,
-	 * which works on any readable directory, BTRFS subvolume or not.
-	 *
-	 * block_size_bits=0 → default (22 = 4 MiB), worker_threads=0 → auto.
+	 * Call bdfs_exec_mkdwarfs directly on the workspace path rather than
+	 * going through BDFS_JOB_EXPORT_TO_DWARFS (which requires a registered
+	 * partition and a valid subvol_id). mkdwarfs -i <dir> works on any
+	 * readable directory. block_size_bits=0 → default (22 = 4 MiB).
 	 */
 	int ret = bdfs_exec_mkdwarfs(d,
 				     ws,
@@ -179,13 +198,29 @@ static int workspace_do_delete(struct bdfs_daemon *d,
 				     job->workspace_shutdown.compression,
 				     /*block_size_bits=*/0,
 				     /*worker_threads=*/0);
+
+	/* Log the event */
+	struct bdfs_shutdown_event ev = {0};
+	ev.timestamp = time(NULL);
+	ev.reason    = BDFS_WS_SHUTDOWN_DELETE;
+	ev.duration_ms = elapsed_ms(&t0);
+	strncpy(ev.workspace_path, ws,         BDFS_PATH_MAX - 1);
+	strncpy(ev.archive_path,   image_path, BDFS_PATH_MAX - 1);
+
 	if (ret) {
+		ev.outcome = (ret == -ETIMEDOUT)
+			     ? BDFS_SHUTDOWN_TIMEOUT : BDFS_SHUTDOWN_ERROR;
+		snprintf(ev.error_msg, sizeof(ev.error_msg),
+			 "mkdwarfs failed: %d", ret);
+		bdfs_shutdown_log_write(d, &ev);
 		syslog(LOG_WARNING,
 		       "bdfs: workspace delete: mkdwarfs failed (non-fatal): %d",
 		       ret);
 		return ret;
 	}
 
+	ev.outcome = BDFS_SHUTDOWN_OK;
+	bdfs_shutdown_log_write(d, &ev);
 	syslog(LOG_INFO, "bdfs: workspace delete: demote complete → %s",
 	       image_path);
 	return 0;

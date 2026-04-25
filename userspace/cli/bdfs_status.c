@@ -12,90 +12,17 @@
  */
 
 #define _GNU_SOURCE
-#include <dirent.h>
-#include <errno.h>
-#include <fnmatch.h>
-#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/un.h>
-#include <time.h>
-#include <unistd.h>
 
 #include "bdfs.h"
-
-/*
- * print_workspace_snapshot_status - scan a BTRFS mount for ws-snap-* entries
- * and print a summary line (or JSON field) showing count and latest snapshot.
- *
- * Called from print_btrfs_subvols when the partition path is known.
- * Non-fatal: errors are silently ignored so status output is never blocked.
- */
-static void print_workspace_snapshot_status(const char *btrfs_mount, bool json)
-{
-	DIR *dir = opendir(btrfs_mount);
-	if (!dir)
-		return;
-
-	uint32_t count = 0;
-	char latest_name[BDFS_NAME_MAX + 1] = "";
-	time_t latest_mtime = 0;
-
-	struct dirent *de;
-	while ((de = readdir(dir)) != NULL) {
-		if (fnmatch("ws-snap-*", de->d_name, 0) != 0)
-			continue;
-
-		char full[BDFS_PATH_MAX];
-		snprintf(full, sizeof(full), "%s/%s", btrfs_mount, de->d_name);
-		struct stat st;
-		if (stat(full, &st) < 0)
-			continue;
-
-		count++;
-		if (st.st_mtime > latest_mtime) {
-			latest_mtime = st.st_mtime;
-			strncpy(latest_name, de->d_name,
-				sizeof(latest_name) - 1);
-		}
-	}
-	closedir(dir);
-
-	/* Check for a DwarFS archive */
-	char archive_path[BDFS_PATH_MAX];
-	snprintf(archive_path, sizeof(archive_path), "%s.dwarfs", btrfs_mount);
-	bool archive_exists = (access(archive_path, F_OK) == 0);
-
-	if (json) {
-		printf(",\"workspace_snapshots\":{\"count\":%u", count);
-		if (count > 0) {
-			char ts[32];
-			struct tm *tm = localtime(&latest_mtime);
-			strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tm);
-			printf(",\"latest\":\"%s\",\"latest_mtime\":\"%s\"",
-			       latest_name, ts);
-		} else {
-			printf(",\"latest\":null,\"latest_mtime\":null");
-		}
-		printf(",\"archive_exists\":%s}",
-		       archive_exists ? "true" : "false");
-	} else {
-		printf("  Workspace snapshots: %u", count);
-		if (count > 0) {
-			char ts[32];
-			struct tm *tm = localtime(&latest_mtime);
-			strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-			printf("  (latest: %s  %s)", latest_name, ts);
-		}
-		printf("\n");
-		if (archive_exists)
-			printf("  DwarFS archive:      %s\n", archive_path);
-	}
-}
 
 /* Query the daemon socket for a status ping */
 static int query_daemon_status(struct bdfs_cli *cli,
@@ -192,7 +119,6 @@ static void print_btrfs_subvols(struct bdfs_cli *cli,
 	struct bdfs_ioctl_list_btrfs_subvols arg;
 	struct bdfs_btrfs_subvol *buf;
 	uint32_t i, cap = 64;
-	char btrfs_mount[BDFS_PATH_MAX] = "";
 
 	buf = calloc(cap, sizeof(*buf));
 	if (!buf) return;
@@ -216,18 +142,6 @@ static void print_btrfs_subvols(struct bdfs_cli *cli,
 			goto out;
 	}
 
-	/*
-	 * Derive the BTRFS mount path from the first subvolume entry so we
-	 * can scan for workspace snapshots. The mount path is the directory
-	 * component of the first subvol's path.
-	 */
-	if (arg.count > 0 && buf[0].path[0] != '\0') {
-		strncpy(btrfs_mount, buf[0].path, sizeof(btrfs_mount) - 1);
-		char *slash = strrchr(btrfs_mount, '/');
-		if (slash && slash != btrfs_mount)
-			*slash = '\0';
-	}
-
 	if (json) {
 		printf("\"subvols\":[");
 		for (i = 0; i < arg.count; i++) {
@@ -235,8 +149,6 @@ static void print_btrfs_subvols(struct bdfs_cli *cli,
 			bdfs_print_subvol(&buf[i], true);
 		}
 		printf("]");
-		if (btrfs_mount[0] != '\0')
-			print_workspace_snapshot_status(btrfs_mount, true);
 	} else {
 		printf("  BTRFS subvolumes/snapshots (%u):\n", arg.count);
 		for (i = 0; i < arg.count; i++) {
@@ -247,8 +159,6 @@ static void print_btrfs_subvols(struct bdfs_cli *cli,
 			bdfs_print_subvol(&buf[i], false);
 			printf("\n");
 		}
-		if (btrfs_mount[0] != '\0')
-			print_workspace_snapshot_status(btrfs_mount, false);
 	}
 
 out:
