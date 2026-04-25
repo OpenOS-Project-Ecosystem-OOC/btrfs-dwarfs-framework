@@ -197,15 +197,16 @@ if(BUILD_GITLAB_ENHANCED)
             VERBATIM
         )
 
-        # Custom target: build bdfs-pin-helper
+        # Custom target: build bdfs-pin-helper from the gitlab-enhanced root module.
+        # No separate go.mod — it is part of the gitlab-enhanced module and imports
+        # dwarfspin directly by module path with no replace directive.
         add_custom_target(bdfs-pin-helper ALL
-            COMMAND ${GO_EXECUTABLE} mod tidy
             COMMAND ${GO_EXECUTABLE} build
                     -ldflags "-s -w"
                     -o "${GLE_BUILD_DIR}/bdfs-pin-helper"
-                    .
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../tools/bdfs-pin-helper"
-            COMMENT "Building bdfs-pin-helper"
+                    ./tools/bdfs-pin-helper/
+            WORKING_DIRECTORY "${GLE_DIR}"
+            COMMENT "Building bdfs-pin-helper from gitlab-enhanced root module"
             VERBATIM
         )
 

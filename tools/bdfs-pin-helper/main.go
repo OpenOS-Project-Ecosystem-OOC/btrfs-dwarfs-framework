@@ -2,14 +2,22 @@
 //
 // bdfs-pin-helper — thin CLI wrapper around dwarfspin.Pinner.
 //
-// Called by the bdfs daemon after a successful workspace demote to pin the
-// resulting DwarFS archive to IPFS. Keeping this as a separate process avoids
-// CGo and lets the C daemon stay dependency-free.
+// NOTE: The canonical source and build for this binary lives in the
+// gitlab-enhanced monorepo at tools/bdfs-pin-helper/main.go, which is
+// part of the gitlab-enhanced root Go module. This copy exists for
+// reference only. Build and install via:
+//
+//	make install-pin-helper          (uses integrations/gitlab-enhanced)
+//	make install-gitlab-enhanced     (builds everything)
+//
+// Called by bdfs_daemon after a successful workspace demote to pin the
+// resulting DwarFS archive to IPFS. Running as a subprocess avoids CGo
+// and keeps the C daemon dependency-free.
 //
 // Usage:
 //
-//	bdfs-pin-helper --archive <path> --kubo-api <url> --index <db-path>
-//	                [--chunk-size-kb <n>] [--timeout <seconds>]
+//	bdfs-pin-helper --archive <path> --kubo-api <url>
+//	                [--index <db-path>] [--chunk-size-kb <n>] [--timeout <seconds>]
 //
 // Output (stdout, one JSON line):
 //

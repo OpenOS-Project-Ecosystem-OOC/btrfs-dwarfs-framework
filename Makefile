@@ -117,8 +117,11 @@ install-pin-helper: submodule-init
 	    echo "ERROR: go not found. Install Go >= 1.21 to build bdfs-pin-helper."; \
 	    exit 1; \
 	fi
-	cd tools/bdfs-pin-helper && $(GO) mod tidy && \
-	    $(GO) build -o $(CURDIR)/build/bdfs-pin-helper .
+	@mkdir -p build
+	cd $(GLE_DIR) && $(GO) build \
+	    -ldflags "-s -w" \
+	    -o $(CURDIR)/build/bdfs-pin-helper \
+	    ./tools/bdfs-pin-helper/
 	install -Dm755 build/bdfs-pin-helper $(DESTDIR)$(PREFIX)/bin/bdfs-pin-helper
 	@echo "Installed $(PREFIX)/bin/bdfs-pin-helper"
 

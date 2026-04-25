@@ -154,13 +154,12 @@ RUN set -eux; \
     cd /build/gitlab-enhanced; \
     go build -ldflags "-s -w" -o /usr/local/bin/gitlab-enhanced ./cmd/gitlab-enhanced/; \
     \
-    # Build bdfs-pin-helper from tools/bdfs-pin-helper inside the submodule.
-    # The go.mod replace directive points at ../../ipfs/dwarfs-pin which
-    # resolves correctly from within the submodule directory.
+    # Build bdfs-pin-helper from the gitlab-enhanced root module.
+    # It lives at tools/bdfs-pin-helper/main.go and imports dwarfspin
+    # directly by module path — no separate go.mod or replace directive.
     if [ -d /build/gitlab-enhanced/tools/bdfs-pin-helper ]; then \
-        cd /build/gitlab-enhanced/tools/bdfs-pin-helper; \
-        go mod tidy; \
-        go build -ldflags "-s -w" -o /usr/local/bin/bdfs-pin-helper .; \
+        cd /build/gitlab-enhanced; \
+        go build -ldflags "-s -w" -o /usr/local/bin/bdfs-pin-helper ./tools/bdfs-pin-helper/; \
     fi; \
     \
     # Install Incus runner executor scripts
