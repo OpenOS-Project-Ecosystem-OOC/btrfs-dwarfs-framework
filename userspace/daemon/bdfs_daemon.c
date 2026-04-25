@@ -108,6 +108,9 @@ static void *worker_thread(void *arg)
 		case BDFS_JOB_AUTOSNAP_ROLLBACK:
 			result = bdfs_job_autosnap_rollback(d, job);
 			break;
+		case BDFS_JOB_WORKSPACE_SHUTDOWN:
+			result = bdfs_job_workspace_shutdown(d, job);
+			break;
 		default:
 			syslog(LOG_WARNING, "bdfs: unknown job type %d", job->type);
 			result = -EINVAL;
