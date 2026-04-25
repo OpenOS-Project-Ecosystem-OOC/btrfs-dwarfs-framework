@@ -73,6 +73,9 @@ integration-test:
   stage: integration
   # Privileged mode is required for loopback device creation (losetup) and
   # BTRFS/FUSE mounts. The runner must have privileged: true in its config.
+  # allow_failure: true so the MR is not blocked when no privileged runner
+  # is available — the job will still appear as a warning in the pipeline.
+  allow_failure: true
   tags:
     - privileged
   image: ubuntu:22.04
