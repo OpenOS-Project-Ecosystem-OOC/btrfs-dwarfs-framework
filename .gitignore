@@ -29,3 +29,6 @@ CTestTestfile.cmake
 # Test artefacts
 /tmp/bdfs_*
 .npmrc
+
+# Integration test results (CI artifacts)
+tests/integration/results/
