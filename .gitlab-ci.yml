@@ -4,6 +4,7 @@
 stages:
   - secret-scan
   - test
+  - integration
   - build
 
 default:
@@ -64,6 +65,57 @@ autosnap-makefile-check:
   script:
     - make --dry-run install-autosnap DESTDIR=/tmp/bdfs-test
     - make --dry-run uninstall-autosnap DESTDIR=/tmp/bdfs-test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+integration-test:
+  stage: integration
+  # Privileged mode is required for loopback device creation (losetup) and
+  # BTRFS/FUSE mounts. The runner must have privileged: true in its config.
+  tags:
+    - privileged
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends
+        btrfs-progs
+        fuse3
+        fuse-overlayfs
+        curl
+        xz-utils
+        sqlite3
+    # Install DwarFS universal binary (mkdwarfs, dwarfs, dwarfsextract)
+    - |
+      DWARFS_VERSION=0.10.2
+      curl -fsSL \
+        "https://github.com/mhx/dwarfs/releases/download/v${DWARFS_VERSION}/dwarfs-universal-${DWARFS_VERSION}-Linux-x86_64.tar.xz" \
+        -o /tmp/dwarfs.tar.xz
+      tar -xf /tmp/dwarfs.tar.xz -C /tmp
+      install -m 0755 /tmp/dwarfs-universal-*/dwarfs-universal /usr/local/bin/dwarfs-universal
+      ln -sf dwarfs-universal /usr/local/bin/mkdwarfs
+      ln -sf dwarfs-universal /usr/local/bin/dwarfs
+      ln -sf dwarfs-universal /usr/local/bin/dwarfsextract
+      ln -sf dwarfs-universal /usr/local/bin/dwarfsck
+      rm -rf /tmp/dwarfs.tar.xz /tmp/dwarfs-universal-*
+    # Install Kubo (IPFS) for the IPFS pinning integration test
+    - |
+      KUBO_VERSION=0.29.0
+      curl -fsSL \
+        "https://dist.ipfs.tech/kubo/v${KUBO_VERSION}/kubo_v${KUBO_VERSION}_linux-amd64.tar.gz" \
+        -o /tmp/kubo.tar.gz
+      tar -xf /tmp/kubo.tar.gz -C /tmp
+      install -m 0755 /tmp/kubo/ipfs /usr/local/bin/ipfs
+      rm -rf /tmp/kubo.tar.gz /tmp/kubo
+  script:
+    - bash tests/integration/run_all.sh
+  artifacts:
+    when: always
+    paths:
+      - tests/integration/results/
+    reports:
+      junit: tests/integration/results/junit.xml
+    expire_in: 14 days
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'

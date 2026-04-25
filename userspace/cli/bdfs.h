@@ -98,4 +98,20 @@ void bdfs_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* autosnap subcommand group */
 int cmd_autosnap(struct bdfs_cli *cli, int argc, char *argv[]);
 
+/*
+ * workspace-shutdown — send BDFS_JOB_WORKSPACE_SHUTDOWN to the daemon.
+ *
+ * Usage:
+ *   bdfs workspace-shutdown --reason pause|delete|stop \
+ *                           --workspace-path <path>
+ *                           [--compression zstd|lzma|lz4|brotli|none]
+ *                           [--prune-keep <n>]
+ *                           [--image-path <path>]
+ *
+ * Called by bdfs-workspace-shutdown@.service before a workspace container
+ * is stopped. Sends the job via the daemon Unix socket and waits for
+ * completion.
+ */
+int cmd_workspace_shutdown(struct bdfs_cli *cli, int argc, char *argv[]);
+
 #endif /* _BDFS_CLI_H */

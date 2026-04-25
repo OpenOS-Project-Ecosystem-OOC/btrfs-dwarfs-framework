@@ -22,7 +22,6 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
-#include <fnmatch.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,38 +161,27 @@ static int workspace_do_delete(struct bdfs_daemon *d,
 	       ws, image_path, job->workspace_shutdown.compression);
 
 	/*
-	 * Reuse the export-to-dwarfs job machinery: build a synthetic job
-	 * targeting the workspace subvolume and dispatch it synchronously.
+	 * Call bdfs_exec_mkdwarfs directly on the workspace path.
+	 *
+	 * We do not go through BDFS_JOB_EXPORT_TO_DWARFS because that path
+	 * uses btrfs-send | mkdwarfs piped import, which requires a valid
+	 * subvol_id and a registered partition — neither of which is
+	 * guaranteed for an arbitrary workspace subvolume path.
+	 *
+	 * bdfs_exec_mkdwarfs runs mkdwarfs -i <ws> -o <image> directly,
+	 * which works on any readable directory, BTRFS subvolume or not.
+	 *
+	 * block_size_bits=0 → default (22 = 4 MiB), worker_threads=0 → auto.
 	 */
-	struct bdfs_job *exp = bdfs_job_alloc(BDFS_JOB_EXPORT_TO_DWARFS);
-	if (!exp) {
-		syslog(LOG_ERR, "bdfs: workspace delete: job alloc failed");
-		return -ENOMEM;
-	}
-
-	snprintf(exp->export_to_dwarfs.image_path,
-		 sizeof(exp->export_to_dwarfs.image_path), "%s", image_path);
-	snprintf(exp->export_to_dwarfs.image_name,
-		 sizeof(exp->export_to_dwarfs.image_name), "workspace");
-	exp->export_to_dwarfs.compression =
-		job->workspace_shutdown.compression;
-	exp->export_to_dwarfs.worker_threads = 2;
-
-	/*
-	 * btrfs_mount: parent directory of the workspace subvolume.
-	 * subvol_id: 0 — the export handler will use btrfs_mount directly
-	 * when subvol_id is 0, treating btrfs_mount as the source path.
-	 */
-	snprintf(exp->export_to_dwarfs.btrfs_mount,
-		 sizeof(exp->export_to_dwarfs.btrfs_mount), "%s", ws);
-	exp->export_to_dwarfs.subvol_id = 0;
-
-	int ret = bdfs_job_export_to_dwarfs(d, exp);
-	bdfs_job_free(exp);
-
+	int ret = bdfs_exec_mkdwarfs(d,
+				     ws,
+				     image_path,
+				     job->workspace_shutdown.compression,
+				     /*block_size_bits=*/0,
+				     /*worker_threads=*/0);
 	if (ret) {
 		syslog(LOG_WARNING,
-		       "bdfs: workspace delete: demote failed (non-fatal): %d",
+		       "bdfs: workspace delete: mkdwarfs failed (non-fatal): %d",
 		       ret);
 		return ret;
 	}

@@ -39,6 +39,7 @@ int cmd_verify(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_setup(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_home(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_autosnap(struct bdfs_cli *cli, int argc, char *argv[]);
+int cmd_workspace_shutdown(struct bdfs_cli *cli, int argc, char *argv[]);
 
 /* ── Command table ───────────────────────────────────────────────────────── */
 
@@ -76,6 +77,8 @@ static const struct bdfs_command COMMANDS[] = {
 	  "Home directory subvolume init, snapshots, and DwarFS archival" },
 	{ "autosnap",  NULL,     cmd_autosnap,
 	  "Manage package-manager snapshots (list, delete, rollback, status, prune)" },
+	{ "workspace-shutdown", NULL, cmd_workspace_shutdown,
+	  "Send workspace lifecycle hook to daemon (pause|delete|stop)" },
 };
 
 /* blend is a sub-namespace: `bdfs blend mount` / `bdfs blend umount` */
