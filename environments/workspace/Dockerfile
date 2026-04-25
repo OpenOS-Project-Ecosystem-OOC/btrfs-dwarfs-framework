@@ -109,20 +109,12 @@ RUN set -eux; \
 # bfg is a Python tool that provides git-like snapshot workflows on BTRFS
 # subvolumes (bfg local_commit, bfg push, bfg pull).
 #
-# Install from the btr-fs-git submodule bundled in this repo, or from the
-# upstream repository when BDFS_REPO is set.
+# Installed from the btr-fs-git submodule. The bdfs_transfer + bdfs_patch
+# modules are included in the package and wire bfg to bdfs and bdfs-pin-helper.
 
 COPY integrations/btr-fs-git/ /build/bfg/
 
 RUN set -eux; \
-    if [ -n "${BDFS_REPO}" ]; then \
-        git clone --depth=1 \
-            https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btr-fs-git.git \
-            /build/bfg-remote; \
-        cp -r /build/bfg-remote/. /build/bfg/; \
-    fi; \
-    # Install bfg as a Python package if setup.py / pyproject.toml exists,
-    # otherwise install the standalone script directly.
     if [ -f /build/bfg/setup.py ] || [ -f /build/bfg/pyproject.toml ]; then \
         pip3 install --no-cache-dir /build/bfg; \
     elif [ -f /build/bfg/bfg ]; then \
@@ -130,14 +122,70 @@ RUN set -eux; \
     elif [ -f /build/bfg/bfg.py ]; then \
         install -m 0755 /build/bfg/bfg.py /usr/local/bin/bfg; \
     fi; \
-    rm -rf /build/bfg /build/bfg-remote; \
-    # Smoke test — bfg prints usage when called with no args (exit 1 is fine)
+    rm -rf /build/bfg; \
     bfg --help 2>&1 | grep -qi "bfg\|usage" || true
+
+# ── gitlab-enhanced ───────────────────────────────────────────────────────────
+#
+# Installs two binaries from the gitlab-enhanced submodule:
+#
+#   gitlab-enhanced  — local-first GitLab stack manager CLI
+#   bdfs-pin-helper  — IPFS pinning helper called by bdfs_daemon after
+#                      workspace demote (wraps dwarfspin.Pinner via Kubo API)
+#
+# Also installs the Incus runner executor scripts to
+# /usr/local/lib/gitlab-runner-incus/ for use on runner hosts.
+
+ARG GO_VERSION=1.25.0
+ARG GOARCH=amd64
+
+COPY integrations/gitlab-enhanced/ /build/gitlab-enhanced/
+
+RUN set -eux; \
+    # Install Go if not already present
+    if ! command -v go >/dev/null 2>&1; then \
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" \
+            | tar -C /usr/local -xz; \
+        export PATH="/usr/local/go/bin:$PATH"; \
+    fi; \
+    export PATH="/usr/local/go/bin:$PATH"; \
+    \
+    # Build gitlab-enhanced CLI
+    cd /build/gitlab-enhanced; \
+    go build -ldflags "-s -w" -o /usr/local/bin/gitlab-enhanced ./cmd/gitlab-enhanced/; \
+    \
+    # Build bdfs-pin-helper from tools/bdfs-pin-helper inside the submodule.
+    # The go.mod replace directive points at ../../ipfs/dwarfs-pin which
+    # resolves correctly from within the submodule directory.
+    if [ -d /build/gitlab-enhanced/tools/bdfs-pin-helper ]; then \
+        cd /build/gitlab-enhanced/tools/bdfs-pin-helper; \
+        go mod tidy; \
+        go build -ldflags "-s -w" -o /usr/local/bin/bdfs-pin-helper .; \
+    fi; \
+    \
+    # Install Incus runner executor scripts
+    install -d /usr/local/lib/gitlab-runner-incus; \
+    for s in config.sh prepare.sh run.sh cleanup.sh; do \
+        install -m 0755 /build/gitlab-enhanced/runtime/incus/runner/$s \
+            /usr/local/lib/gitlab-runner-incus/$s; \
+    done; \
+    \
+    # Install Incus profiles
+    install -d /usr/share/gitlab-enhanced/profiles; \
+    for p in gitlab-runner.yaml workspace-default.yaml; do \
+        f="/build/gitlab-enhanced/runtime/incus/profiles/$p"; \
+        [ -f "$f" ] && install -m 0644 "$f" /usr/share/gitlab-enhanced/profiles/$p || true; \
+    done; \
+    \
+    rm -rf /build/gitlab-enhanced; \
+    # Smoke tests
+    gitlab-enhanced --help 2>&1 | grep -qi "gitlab\|usage" || true; \
+    bdfs-pin-helper --help 2>&1 | grep -qi "archive\|usage\|required" || true
 
 # ── Runtime configuration ─────────────────────────────────────────────────────
 
 # Default bdfs daemon config
-RUN mkdir -p /etc/bdfs /var/lib/bdfs /run/bdfs
+RUN mkdir -p /etc/bdfs /var/lib/bdfs /run/bdfs /etc/gitlab-enhanced
 COPY configs/bdfs.conf /etc/bdfs/bdfs.conf
 
 # Allow the workspace user to run bdfs and btrfs without a password.
@@ -159,6 +207,8 @@ WORKDIR /workspace
 RUN bdfs --version \
     && mkdwarfs --version 2>&1 | grep -q dwarfs \
     && dwarfsextract --version 2>&1 | grep -q dwarfs \
-    && bfg --help 2>&1 | grep -qi "bfg\|usage" || true
+    && bfg --help 2>&1 | grep -qi "bfg\|usage" || true \
+    && gitlab-enhanced --help 2>&1 | grep -qi "gitlab\|usage" || true \
+    && bdfs-pin-helper --help 2>&1 | grep -qi "archive\|required" || true
 
 CMD ["/bin/bash"]

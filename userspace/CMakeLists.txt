@@ -7,10 +7,11 @@ project(btrfs_dwarfs_userspace
 )
 
 # ── Build options ────────────────────────────────────────────────────────────
-option(BUILD_DAEMON  "Build the bdfs_daemon"  ON)
-option(BUILD_CLI     "Build the bdfs CLI"     ON)
-option(BUILD_TESTS   "Build unit tests"       OFF)
-option(ENABLE_ASAN   "Enable AddressSanitizer" OFF)
+option(BUILD_DAEMON           "Build the bdfs_daemon"                    ON)
+option(BUILD_CLI              "Build the bdfs CLI"                       ON)
+option(BUILD_TESTS            "Build unit tests"                         OFF)
+option(ENABLE_ASAN            "Enable AddressSanitizer"                  OFF)
+option(BUILD_GITLAB_ENHANCED  "Build and install gitlab-enhanced + bdfs-pin-helper from integrations/gitlab-enhanced submodule" OFF)
 
 # ── Compiler flags ───────────────────────────────────────────────────────────
 set(CMAKE_C_STANDARD 11)
@@ -56,6 +57,7 @@ include_directories(
 if(BUILD_DAEMON)
     add_executable(bdfs_daemon
         daemon/bdfs_daemon.c
+        daemon/bdfs_config.c
         daemon/bdfs_exec.c
         daemon/bdfs_jobs.c
         daemon/bdfs_netlink.c
@@ -146,6 +148,103 @@ if(BUILD_CLI)
     )
 endif()
 
+# ── gitlab-enhanced integration ──────────────────────────────────────────────
+# When BUILD_GITLAB_ENHANCED=ON, invoke the Makefile targets that build
+# bdfs-pin-helper and the gitlab-enhanced CLI from the submodule at
+# integrations/gitlab-enhanced, then install them alongside bdfs.
+#
+# This is equivalent to running `make install-gitlab-enhanced` from the
+# top-level Makefile, but wired into the CMake install step so that
+# cmake --install <build_dir> covers everything in one command.
+#
+# Requires: go >= 1.21, pip3 (for bfg), git submodule initialised.
+
+if(BUILD_GITLAB_ENHANCED)
+    find_program(GO_EXECUTABLE go DOC "Go compiler")
+    if(NOT GO_EXECUTABLE)
+        message(WARNING
+            "BUILD_GITLAB_ENHANCED=ON but 'go' not found. "
+            "Install Go >= 1.21 or set GO_EXECUTABLE. "
+            "Skipping gitlab-enhanced build.")
+    else()
+        set(GLE_DIR "${CMAKE_SOURCE_DIR}/../integrations/gitlab-enhanced")
+        set(BFG_DIR "${CMAKE_SOURCE_DIR}/../integrations/btr-fs-git")
+        set(GLE_BUILD_DIR "${CMAKE_BINARY_DIR}/gitlab-enhanced")
+
+        # Ensure submodule is initialised
+        if(NOT EXISTS "${GLE_DIR}/go.mod")
+            message(STATUS "Initialising integrations/gitlab-enhanced submodule...")
+            execute_process(
+                COMMAND git submodule update --init --recursive
+                        integrations/gitlab-enhanced
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+                RESULT_VARIABLE _sub_result
+            )
+            if(NOT _sub_result EQUAL 0)
+                message(WARNING "git submodule update failed for gitlab-enhanced")
+            endif()
+        endif()
+
+        # Custom target: build gitlab-enhanced CLI
+        add_custom_target(gitlab-enhanced-cli ALL
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GLE_BUILD_DIR}"
+            COMMAND ${GO_EXECUTABLE} build
+                    -ldflags "-s -w"
+                    -o "${GLE_BUILD_DIR}/gitlab-enhanced"
+                    ./cmd/gitlab-enhanced/
+            WORKING_DIRECTORY "${GLE_DIR}"
+            COMMENT "Building gitlab-enhanced CLI"
+            VERBATIM
+        )
+
+        # Custom target: build bdfs-pin-helper
+        add_custom_target(bdfs-pin-helper ALL
+            COMMAND ${GO_EXECUTABLE} mod tidy
+            COMMAND ${GO_EXECUTABLE} build
+                    -ldflags "-s -w"
+                    -o "${GLE_BUILD_DIR}/bdfs-pin-helper"
+                    .
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../tools/bdfs-pin-helper"
+            COMMENT "Building bdfs-pin-helper"
+            VERBATIM
+        )
+
+        # Install both binaries
+        install(PROGRAMS
+            "${GLE_BUILD_DIR}/gitlab-enhanced"
+            "${GLE_BUILD_DIR}/bdfs-pin-helper"
+            DESTINATION bin
+        )
+
+        # Install Incus runner executor scripts
+        install(PROGRAMS
+            "${GLE_DIR}/runtime/incus/runner/config.sh"
+            "${GLE_DIR}/runtime/incus/runner/prepare.sh"
+            "${GLE_DIR}/runtime/incus/runner/run.sh"
+            "${GLE_DIR}/runtime/incus/runner/cleanup.sh"
+            DESTINATION lib/gitlab-runner-incus
+        )
+
+        # Install Incus profiles
+        install(FILES
+            "${GLE_DIR}/runtime/incus/profiles/gitlab-runner.yaml"
+            "${GLE_DIR}/runtime/incus/profiles/workspace-default.yaml"
+            DESTINATION share/gitlab-enhanced/profiles
+            OPTIONAL
+        )
+
+        # Install gitlab-enhanced default config
+        install(FILES
+            "${GLE_DIR}/config/defaults.yaml"
+            DESTINATION etc/gitlab-enhanced
+            RENAME defaults.yaml
+            OPTIONAL
+        )
+
+        message(STATUS "gitlab-enhanced integration: enabled (go=${GO_EXECUTABLE})")
+    endif()
+endif()
+
 # ── Unit tests ───────────────────────────────────────────────────────────────
 if(BUILD_TESTS)
     enable_testing()
@@ -155,9 +254,10 @@ endif()
 # ── Summary ──────────────────────────────────────────────────────────────────
 message(STATUS "")
 message(STATUS "BTRFS+DwarFS userspace build configuration:")
-message(STATUS "  Build daemon : ${BUILD_DAEMON}")
-message(STATUS "  Build CLI    : ${BUILD_CLI}")
-message(STATUS "  Build tests  : ${BUILD_TESTS}")
-message(STATUS "  ASAN         : ${ENABLE_ASAN}")
-message(STATUS "  Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "  Build daemon          : ${BUILD_DAEMON}")
+message(STATUS "  Build CLI             : ${BUILD_CLI}")
+message(STATUS "  Build tests           : ${BUILD_TESTS}")
+message(STATUS "  ASAN                  : ${ENABLE_ASAN}")
+message(STATUS "  Build gitlab-enhanced : ${BUILD_GITLAB_ENHANCED}")
+message(STATUS "  Install prefix        : ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")

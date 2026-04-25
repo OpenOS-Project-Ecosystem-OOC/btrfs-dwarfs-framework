@@ -7,4 +7,4 @@ require (
 	modernc.org/sqlite v1.29.10
 )
 
-replace gitlab.com/openos-project/git-management_deving/gitlab-enhanced/ipfs/dwarfs-pin => ../../ipfs/dwarfs-pin
+replace gitlab.com/openos-project/git-management_deving/gitlab-enhanced/ipfs/dwarfs-pin => ../../integrations/gitlab-enhanced/ipfs/dwarfs-pin
