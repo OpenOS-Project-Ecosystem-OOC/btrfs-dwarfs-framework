@@ -51,13 +51,13 @@ int cmd_umount(struct bdfs_cli *cli, int argc, char *argv[]);
 
 /* snapshot */
 int cmd_snapshot(struct bdfs_cli *cli, int argc, char *argv[]);
-int cmd_snapshot_take(struct bdfs_cli *cli, int argc, char *argv[]);
-int cmd_snapshot_status(struct bdfs_cli *cli, int argc, char *argv[]);
-int cmd_workspace_shutdown(struct bdfs_cli *cli, int argc, char *argv[]);
 
 /* promote / demote (blend layer) */
 int cmd_promote(struct bdfs_cli *cli, int argc, char *argv[]);
 int cmd_demote(struct bdfs_cli *cli, int argc, char *argv[]);
+
+/* fetch — restore workspace from IPFS CID */
+int cmd_fetch(struct bdfs_cli *cli, int argc, char *argv[]);
 
 /* blend mount/umount */
 int cmd_blend_mount(struct bdfs_cli *cli, int argc, char *argv[]);

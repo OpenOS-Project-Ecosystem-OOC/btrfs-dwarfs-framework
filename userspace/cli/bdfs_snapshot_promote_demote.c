@@ -33,8 +33,11 @@
 
 /* ── bdfs snapshot ───────────────────────────────────────────────────────── */
 
-int cmd_snapshot_take(struct bdfs_cli *cli, int argc, char *argv[])
+int cmd_snapshot(struct bdfs_cli *cli, int argc, char *argv[])
 {
+	/* If first arg is "prune", delegate */
+	if (argc > 0 && strcmp(argv[0], "prune") == 0)
+		return cmd_snapshot_prune(cli, argc - 1, argv + 1);
 
 	struct bdfs_ioctl_snapshot_dwarfs_container arg;
 	int opt;
@@ -334,4 +337,3 @@ int cmd_demote(struct bdfs_cli *cli, int argc, char *argv[])
 		       (unsigned long long)arg.image_id_out);
 	return 0;
 }
-

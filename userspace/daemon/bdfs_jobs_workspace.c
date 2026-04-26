@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,6 +174,81 @@ static int workspace_do_pause(struct bdfs_daemon *d,
 
 /* ── Delete: bdfs demote ─────────────────────────────────────────────────── */
 
+/*
+ * extract_cid_from_json - pull the "cid" string value out of the one-line
+ * JSON object emitted by bdfs-pin-helper.
+ *
+ * Expected format: {"cid":"<CID>","cached":...,"size_bytes":...}
+ * Writes at most outsz-1 bytes into out. Returns true on success.
+ */
+static bool extract_cid_from_json(const char *json, char *out, size_t outsz)
+{
+	const char *key = "\"cid\":\"";
+	const char *p = strstr(json, key);
+	if (!p)
+		return false;
+	p += strlen(key);
+	const char *end = strchr(p, '"');
+	if (!end)
+		return false;
+	size_t len = (size_t)(end - p);
+	if (len == 0 || len >= outsz)
+		return false;
+	memcpy(out, p, len);
+	out[len] = '\0';
+	return true;
+}
+
+/*
+ * pin_archive_to_ipfs - call bdfs-pin-helper as a subprocess and store the
+ * resulting CID in cid_out.
+ *
+ * Best-effort: logs warnings on failure but does not propagate errors to the
+ * caller. The workspace must be deleted regardless of whether pinning works.
+ */
+static void pin_archive_to_ipfs(struct bdfs_daemon *d,
+				const char *image_path,
+				char *cid_out, size_t cid_outsz)
+{
+	const char *helper = d->cfg.pin_helper_bin[0]
+			     ? d->cfg.pin_helper_bin
+			     : "bdfs-pin-helper";
+	const char *kubo   = d->cfg.kubo_api[0]
+			     ? d->cfg.kubo_api
+			     : "http://127.0.0.1:5001";
+
+	const char *argv[] = {
+		helper,
+		"--archive", image_path,
+		"--kubo-api", kubo,
+		NULL
+	};
+
+	/* Allow up to 30 minutes for large archives */
+	const int pin_timeout_s = 1800;
+	char json_buf[512] = {0};
+
+	syslog(LOG_INFO, "bdfs: pin-helper: pinning %s via %s", image_path, kubo);
+
+	int ret = bdfs_exec_capture_output(argv, pin_timeout_s,
+					   json_buf, sizeof(json_buf));
+	if (ret) {
+		syslog(LOG_WARNING,
+		       "bdfs: pin-helper: failed for %s (ret=%d, non-fatal)",
+		       image_path, ret);
+		return;
+	}
+
+	if (!extract_cid_from_json(json_buf, cid_out, cid_outsz)) {
+		syslog(LOG_WARNING,
+		       "bdfs: pin-helper: could not parse CID from output: %.128s",
+		       json_buf);
+		return;
+	}
+
+	syslog(LOG_INFO, "bdfs: pin-helper: pinned %s → %s", image_path, cid_out);
+}
+
 static int workspace_do_delete(struct bdfs_daemon *d,
 			       const struct bdfs_job *job)
 {
@@ -219,10 +295,17 @@ static int workspace_do_delete(struct bdfs_daemon *d,
 		return ret;
 	}
 
+	/*
+	 * Pin the archive to IPFS. Best-effort: a failure here does not
+	 * prevent the shutdown log entry from being written or the workspace
+	 * from being deleted. archive_cid stays "" if pinning is unavailable.
+	 */
+	pin_archive_to_ipfs(d, image_path, ev.archive_cid, sizeof(ev.archive_cid));
+
 	ev.outcome = BDFS_SHUTDOWN_OK;
 	bdfs_shutdown_log_write(d, &ev);
-	syslog(LOG_INFO, "bdfs: workspace delete: demote complete → %s",
-	       image_path);
+	syslog(LOG_INFO, "bdfs: workspace delete: demote complete → %s (cid=%s)",
+	       image_path, ev.archive_cid[0] ? ev.archive_cid : "(not pinned)");
 	return 0;
 }
 

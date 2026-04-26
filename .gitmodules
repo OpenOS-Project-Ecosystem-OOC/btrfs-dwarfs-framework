@@ -10,3 +10,6 @@
 [submodule "integrations/ashos"]
 	path = integrations/ashos
 	url = https://gitlab.com/openos-project/linux-kernel_filesystem_deving/ashos.git
+[submodule "integrations/gitlab-enhanced"]
+	path = integrations/gitlab-enhanced
+	url = https://gitlab.com/openos-project/git-management_deving/gitlab-enhanced.git
