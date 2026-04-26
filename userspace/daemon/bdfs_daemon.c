@@ -31,6 +31,7 @@
 #endif
 
 #include "bdfs_daemon.h"
+#include "bdfs_config.h"
 #include "bdfs_policy.h"
 
 #define BDFS_DEFAULT_CTL_DEVICE  "/dev/bdfs_ctl"
@@ -107,6 +108,9 @@ static void *worker_thread(void *arg)
 			break;
 		case BDFS_JOB_AUTOSNAP_ROLLBACK:
 			result = bdfs_job_autosnap_rollback(d, job);
+			break;
+		case BDFS_JOB_WORKSPACE_SHUTDOWN:
+			result = bdfs_job_workspace_shutdown(d, job);
 			break;
 		default:
 			syslog(LOG_WARNING, "bdfs: unknown job type %d", job->type);
@@ -397,11 +401,12 @@ int main(int argc, char *argv[])
 	struct bdfs_daemon bdfs;
 	struct bdfs_daemon_config cfg;
 	int opt, ret;
+	char config_path[512] = "";
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.daemonize = true;
 
-	while ((opt = getopt(argc, argv, "fc:s:d:j:v")) != -1) {
+	while ((opt = getopt(argc, argv, "fc:s:d:j:C:v")) != -1) {
 		switch (opt) {
 		case 'f':
 			cfg.daemonize = false;
@@ -421,19 +426,68 @@ int main(int argc, char *argv[])
 		case 'j':
 			cfg.worker_threads = atoi(optarg);
 			break;
+		case 'C':
+			strncpy(config_path, optarg, sizeof(config_path) - 1);
+			break;
 		case 'v':
 			cfg.verbose = true;
 			break;
 		default:
 			fprintf(stderr,
 				"Usage: %s [-f] [-c ctl_dev] [-s sock] "
-				"[-d state_dir] [-j threads] [-v]\n",
+				"[-d state_dir] [-j threads] "
+				"[-C config_file] [-v]\n",
 				argv[0]);
 			return 1;
 		}
 	}
 
 	openlog("bdfs_daemon", LOG_PID | LOG_CONS, LOG_DAEMON);
+
+	/*
+	 * Load config file first so CLI flags (applied above) take precedence.
+	 * bdfs_daemon_init() fills in compiled-in defaults for any fields
+	 * still zero/empty after both the file and CLI flags are applied.
+	 *
+	 * We re-apply CLI overrides after loading the file so that explicit
+	 * flags always win over the config file.
+	 */
+	{
+		struct bdfs_daemon_config file_cfg;
+		memset(&file_cfg, 0, sizeof(file_cfg));
+		bdfs_config_load(config_path[0] ? config_path : NULL,
+				 &file_cfg);
+
+		/* Merge: file values fill fields not set by CLI flags */
+		if (!cfg.ctl_device[0] && file_cfg.ctl_device[0])
+			strncpy(cfg.ctl_device, file_cfg.ctl_device,
+				sizeof(cfg.ctl_device) - 1);
+		if (!cfg.socket_path[0] && file_cfg.socket_path[0])
+			strncpy(cfg.socket_path, file_cfg.socket_path,
+				sizeof(cfg.socket_path) - 1);
+		if (!cfg.state_dir[0] && file_cfg.state_dir[0])
+			strncpy(cfg.state_dir, file_cfg.state_dir,
+				sizeof(cfg.state_dir) - 1);
+		if (!cfg.worker_threads && file_cfg.worker_threads)
+			cfg.worker_threads = file_cfg.worker_threads;
+		if (!cfg.mkdwarfs_timeout_s && file_cfg.mkdwarfs_timeout_s)
+			cfg.mkdwarfs_timeout_s = file_cfg.mkdwarfs_timeout_s;
+		if (!cfg.shutdown_log_path[0] && file_cfg.shutdown_log_path[0])
+			strncpy(cfg.shutdown_log_path, file_cfg.shutdown_log_path,
+				sizeof(cfg.shutdown_log_path) - 1);
+		if (!cfg.mkdwarfs_bin[0] && file_cfg.mkdwarfs_bin[0])
+			strncpy(cfg.mkdwarfs_bin, file_cfg.mkdwarfs_bin,
+				sizeof(cfg.mkdwarfs_bin) - 1);
+		if (!cfg.dwarfs_bin[0] && file_cfg.dwarfs_bin[0])
+			strncpy(cfg.dwarfs_bin, file_cfg.dwarfs_bin,
+				sizeof(cfg.dwarfs_bin) - 1);
+		if (!cfg.dwarfsextract_bin[0] && file_cfg.dwarfsextract_bin[0])
+			strncpy(cfg.dwarfsextract_bin, file_cfg.dwarfsextract_bin,
+				sizeof(cfg.dwarfsextract_bin) - 1);
+		if (!cfg.dwarfsck_bin[0] && file_cfg.dwarfsck_bin[0])
+			strncpy(cfg.dwarfsck_bin, file_cfg.dwarfsck_bin,
+				sizeof(cfg.dwarfsck_bin) - 1);
+	}
 
 	if (cfg.daemonize) {
 		if (daemon(0, 0) < 0) {
