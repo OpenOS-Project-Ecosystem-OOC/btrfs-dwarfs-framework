@@ -673,9 +673,10 @@ static void bdfs_handle_client(struct bdfs_daemon *d, int client_fd)
 		int r = bdfs_daemon_enqueue(d, job);
 		if (r == 0)
 			snprintf(resp, sizeof(resp),
-				 "{\"status\":\"ok\",\"data\":{"
+				 "{\"status\":0,\"job_id\":%llu,"
 				 "\"workspace_path\":\"%s\","
-				 "\"reason\":\"%s\"}}\n",
+				 "\"reason\":\"%s\"}\n",
+				 (unsigned long long)job->object_id,
 				 ws_path,
 				 reason_str[0] ? reason_str : "stop");
 		else
