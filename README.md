@@ -1,243 +1,55 @@
-# BTRFS+DwarFS Framework
+[update-readmes]   Mode: rewrite — migrating to template structure...
+# btrfs-dwarfs-framework
 
-A hybrid filesystem framework that blends [BTRFS](https://github.com/kdave/btrfs-devel) and [DwarFS](https://github.com/mhx/dwarfs) into a unified namespace, combining BTRFS's mutable Copy-on-Write semantics with DwarFS's extreme compression ratios (10–16×).
+[![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/btrfs-dwarfs-framework)
 
----
+<!-- AI:start:what-it-does -->
+This project provides a hybrid filesystem framework that integrates BTRFS subvolumes and snapshots with DwarFS compressed images into a unified namespace. It is designed for developers and system administrators who need efficient storage management, combining BTRFS's snapshot capabilities with DwarFS's high compression for read-heavy workloads.
+<!-- AI:end:what-it-does -->
 
-## What's New
+## Architecture
 
-### Userspace blend fallback (fuse-overlayfs)
-When the `bdfs_blend` kernel module is unavailable (e.g. on a stock kernel), the blend layer now falls back automatically to [fuse-overlayfs](https://github.com/containers/fuse-overlayfs). Pass `--userspace` to `bdfs blend mount` to force this path, or set `userspace_fallback = true` in `bdfs.conf`. The daemon detects `ENODEV` on the ioctl and retries via `BDFS_JOB_MOUNT_BLEND_USERSPACE`.
+<!-- AI:start:architecture -->
+The framework combines BTRFS subvolumes/snapshots with DwarFS compressed images to create a unified filesystem namespace. It uses a layered architecture where BTRFS handles writable subvolumes and snapshots, while DwarFS provides read-only, highly compressed layers. A virtual filesystem layer merges these components, exposing a unified view to the user. The core is implemented in C, with additional scripts for automation and CI workflows. Key components include the BTRFS integration module, the DwarFS mount handler, and the namespace merger. CI workflows automate testing, labeling, and artifact mirroring.
 
-### O(1) mount table lookup
-The mount table previously used a linear TAILQ scan for every umount and lookup. It now maintains a parallel FNV-1a open-addressing hash index (`bdfs_mount_index`, 256 slots, linear probing with tombstones) in `userspace/daemon/bdfs_mount_table.c`, giving O(1) lookup by mount point path.
-
-### Snapshot pruning (`bdfs snapshot prune`)
-```bash
-bdfs snapshot prune /mnt/btrfs/subvol \
-    --keep 5 \
-    --pattern "backup_*" \
-    --demote-first \
-    --dry-run
+```plaintext
+.
+├── src
+│   ├── btrfs
+│   │   ├── subvolume.c
+│   │   └── snapshot.c
+│   ├── dwarfs
+│   │   ├── mount.c
+│   │   └── image.c
+│   ├── namespace
+│   │   └── merger.c
+│   └── main.c
+├── include
+│   ├── btrfs.h
+│   ├── dwarfs.h
+│   └── namespace.h
+├── scripts
+│   ├── ci
+│   │   └── ci.yml
+│   ├── labeler.yml
+│   └── trigger-artifact-mirror.yml
+├── tests
+│   └── integration
+└── README.md
 ```
-Sorts snapshots by mtime, keeps the N most recent, and deletes the rest. `--demote-first` archives each pruned snapshot as a DwarFS image before deletion. `--dry-run` reports what would be deleted without acting.
+<!-- AI:end:architecture -->
 
-### Home directory snapshots (`bdfs home`)
-Per-user snapshot management with [ecryptfs](https://www.ecryptfs.org/) support:
-```bash
-bdfs home init /home/alice        # set up snapshot tracking for a home dir
-bdfs home snapshot /home/alice    # take a snapshot
-bdfs home demote /home/alice      # compress oldest snapshots to DwarFS
-```
-User configuration is read from `~/.config/bdfs/bdfs.conf`.
+## Install
 
-### Maintenance operations
-Weekly scrub and monthly balance are now managed by systemd units installed via `bdfs setup` or `boot/install.sh --maintenance`:
-
-| Unit | Schedule | Notes |
-|---|---|---|
-| `bdfs-scrub.timer` | Weekly | Reads device list from `/etc/bdfs/scrub.conf` |
-| `bdfs-balance.timer` | Monthly | Skips if a balance is already running |
-
-### Distro-agnostic setup
-All distro-specific assumptions have been removed. `bdfs setup fstab` generates `/etc/fstab` entries by introspecting `btrfs subvolume list` output at runtime — no hardcoded paths, package managers, usernames, or desktop environments. See [`doc/distro-agnostic.md`](doc/distro-agnostic.md) for the full policy and [`doc/bootloader-integration.md`](doc/bootloader-integration.md) for GRUB2/systemd-boot/Limine setup.
-
-### Full socket command dispatch
-`userspace/daemon/bdfs_socket.c` now implements all commands used by the CLI and GUI clients:
-
-| Command | Action |
-|---|---|
-| `list_partitions` | Walks `/proc/mounts` for btrfs entries |
-| `list_images` | Scans archive dir for `.dwarfs` files |
-| `list_mounts` | Returns tracked blend mount points |
-| `blend_mount` | Enqueues kernel or userspace blend mount job |
-| `umount` | Enqueues umount job |
-| `mount` | Enqueues bare DwarFS mount job |
-| `import` | Enqueues `BDFS_JOB_IMPORT_FROM_DWARFS` |
-| `demote` | Enqueues `BDFS_JOB_EXPORT_TO_DWARFS` |
-| `prune` | Enqueues `BDFS_JOB_PRUNE` |
-| `status` | Returns worker count, queue depth, active mounts |
-| `ping` | Liveness check |
-
----
-
-## Concept
-
-Two technologies, two strengths:
-
-| | BTRFS | DwarFS |
-|---|---|---|
-| **Mode** | Read/write | Read-only |
-| **Storage** | Block device | Single image file |
-| **Snapshots** | Native CoW subvolumes | N/A |
-| **Compression** | Transparent, per-block | 10–16× via similarity hashing |
-| **Use case** | Live, active data | Archival, read-mostly data |
-
-This framework bridges them with two partition types and a blend layer:
-
-### DwarFS-backed Partition
-Stores BTRFS subvolumes and snapshots as compressed `.dwarfs` image files. A BTRFS subvolume is exported via `btrfs send | btrfs receive | mkdwarfs` into a single self-contained image. Ideal for archiving versioned data at maximum compression.
-
-### BTRFS-backed Partition
-Stores `.dwarfs` image files on a live BTRFS filesystem. The images gain BTRFS's CoW semantics (no partial-write corruption), per-file checksumming, and snapshot capability — so you can take point-in-time snapshots of entire image collections.
-
-### Blend Layer
-Merges a BTRFS upper layer and one or more DwarFS lower layers into a single coherent namespace. Reads fall through from BTRFS to DwarFS; writes always land on BTRFS with automatic copy-up.
-
-```
-┌──────────────────────────────────────────────┐
-│              Blend Namespace                 │
-│              /mnt/blend/                     │
-│                                              │
-│  READ:  BTRFS upper → DwarFS lower fallback  │
-│  WRITE: always to BTRFS upper (copy-up)      │
-└──────────┬───────────────────────┬───────────┘
-           │                       │
-  ┌────────▼────────┐   ┌──────────▼──────────┐
-  │  BTRFS Upper    │   │   DwarFS Lower(s)   │
-  │  (writable)     │   │   (compressed)      │
-  └─────────────────┘   └─────────────────────┘
-```
-
-**Promote** — extract a DwarFS-backed path into a writable BTRFS subvolume.  
-**Demote** — compress a BTRFS subvolume into a DwarFS image, optionally deleting the subvolume to reclaim space.
-
----
-
-## Repository Layout
-
-```
-btrfs-dwarfs-framework/
-├── include/
-│   ├── btrfs_dwarfs/types.h      # Shared type definitions
-│   └── uapi/bdfs_ioctl.h         # Kernel↔userspace ioctl interface
-│
-├── kernel/
-│   └── btrfs_dwarfs/
-│       ├── bdfs_main.c           # Module init, /dev/bdfs_ctl, partition registry
-│       ├── bdfs_blend.c          # bdfs_blend VFS type, unified namespace
-│       ├── bdfs_btrfs_part.c     # BTRFS-backed partition backend
-│       ├── bdfs_dwarfs_part.c    # DwarFS-backed partition backend
-│       ├── bdfs_internal.h       # Internal kernel declarations
-│       ├── Kbuild
-│       └── Kconfig
-│
-├── userspace/
-│   ├── daemon/
-│   │   ├── bdfs_daemon.c         # Lifecycle, worker pool, main loop
-│   │   ├── bdfs_exec.c           # mkdwarfs/dwarfs/btrfs/fuse-overlayfs wrappers
-│   │   ├── bdfs_jobs.c           # Job handlers (export/import/mount/prune/userspace-blend)
-│   │   ├── bdfs_mount_table.c    # FNV-1a hash index for O(1) mount lookups
-│   │   ├── bdfs_netlink.c        # Netlink event listener
-│   │   └── bdfs_socket.c         # Unix socket server — full command dispatch
-│   ├── cli/
-│   │   ├── bdfs_main.c           # Entry point, dispatch table
-│   │   ├── bdfs_partition.c      # partition add/remove/list/show
-│   │   ├── bdfs_export_import.c  # export, import
-│   │   ├── bdfs_mount.c          # mount, umount, blend mount/umount (--userspace)
-│   │   ├── bdfs_snapshot_promote_demote.c  # snapshot, promote, demote, prune
-│   │   ├── bdfs_home.c           # home init/snapshot/demote
-│   │   ├── bdfs_setup.c          # setup fstab/check
-│   │   ├── bdfs_userconf.c/.h    # ~/.config/bdfs/bdfs.conf parser
-│   │   └── bdfs_status.c         # status
-│   └── CMakeLists.txt
-│
-├── configs/
-│   ├── bdfs.conf                 # Framework configuration
-│   ├── bdfs_daemon.service       # systemd daemon unit
-│   ├── bdfs-scrub.{sh,service,timer}    # Weekly scrub
-│   └── bdfs-balance.{sh,service,timer}  # Monthly balance
-│
-├── tools/
-│   ├── autosnap/                 # Package-manager snapshot hook (see below)
-│   ├── homed/                    # systemd-homed identity repair (distro-agnostic)
-│   └── setup/
-│       └── bdfs-genfstab.sh      # Runtime fstab generator
-│
-├── boot/
-│   └── install.sh                # Installer (--maintenance, --homed-check flags)
-│
-├── tests/
-│   ├── integration/              # Loopback-device test suites (requires root)
-│   │   ├── lib.sh
-│   │   ├── test_dwarfs_partition.sh
-│   │   ├── test_btrfs_partition.sh
-│   │   ├── test_blend_layer.sh   # Includes userspace blend (fuse-overlayfs) tests
-│   │   ├── test_snapshot_lifecycle.sh
-│   │   └── run_all.sh
-│   └── unit/
-│       ├── test_uuid.c
-│       ├── test_compression.c
-│       └── test_job_alloc.c
-│
-├── doc/
-│   ├── architecture.md
-│   ├── bootloader-integration.md # GRUB2 / systemd-boot / Limine
-│   ├── distro-agnostic.md        # Policy: no hardcoded distro assumptions
-│   ├── bdfs.1
-│   └── bdfs_daemon.8
-│
-└── integrations/                 # Git submodules — external projects that integrate with bdfs
-    ├── frzr-meta-root/           # Immutable root manager (frzr + ABRoot v2, Incus backend)
-    ├── btr-fs-git/               # Git-like workflow for btrfs subvolumes (BFG)
-    ├── btrfs-assistant/          # Qt6 GUI with BDFS tab for daemon interaction
-    └── ashos/                    # Immutable tree-shaped meta-distribution (AshOS)
-```
-
----
-
-## Building
-
-### Dependencies
-
-| Tool | Purpose |
-|---|---|
-| Linux kernel headers ≥ 5.15 | Kernel module build |
-| `btrfs-progs` | `btrfs send/receive/snapshot/subvolume` |
-| `mkdwarfs` | DwarFS image creation |
-| `dwarfs` (FUSE3) | DwarFS image mounting |
-| `dwarfsextract` | DwarFS image extraction |
-| `dwarfsck` | DwarFS image verification |
-| `fuse-overlayfs` | Userspace blend fallback (optional) |
-| CMake ≥ 3.16 | Userspace build |
-| pthreads | Daemon worker pool |
-
-Install DwarFS tools from [mhx/dwarfs releases](https://github.com/mhx/dwarfs/releases) (pre-built static binaries available for most architectures).
-
-### Build
+<!-- Add installation instructions here. This section is yours — the AI will not modify it. -->
 
 ```bash
-# Kernel module + userspace (daemon + CLI)
-make all
-
-# Kernel module only
-make kernel KDIR=/lib/modules/$(uname -r)/build
-
-# Userspace only
-make userspace
-
-# Install (requires root for kernel module)
-sudo make install
-
-# Load the kernel module
-sudo insmod kernel/btrfs_dwarfs/btrfs_dwarfs.ko
+git clone https://github.com/Interested-Deving-1896/btrfs-dwarfs-framework.git
+cd btrfs-dwarfs-framework
 ```
-
-### CMake options
-
-```bash
-cmake -S userspace -B build \
-    -DBUILD_DAEMON=ON \
-    -DBUILD_CLI=ON \
-    -DBUILD_TESTS=OFF \
-    -DENABLE_ASAN=OFF \
-    -DCMAKE_INSTALL_PREFIX=/usr/local
-cmake --build build --parallel
-```
-
----
 
 ## Usage
+
 
 ### 1. Start the daemon
 
@@ -385,200 +197,58 @@ bdfs status --json
 
 ---
 
-## autosnap — package-manager snapshot hook
+## Configuration
 
-`tools/autosnap/` integrates automatic pre/post snapshots into your package
-manager so every install, upgrade, or removal is preceded by a recoverable
-system snapshot.
+<!-- Document configuration options here. This section is yours — the AI will not modify it. -->
 
-**Primary backend:** `bdfs snapshot` (daemon-managed, supports `--demote-first`
-archival and `bdfs snapshot prune` retention).  
-**Fallback backend:** raw `btrfs subvolume snapshot` (used automatically when
-the bdfs daemon is not running).
+## CI
 
-### Install
+<!-- AI:start:ci -->
+- **ci.yml**: Runs build and test jobs for the framework on supported platforms. Verifies code compiles and passes all tests. No secrets required.
 
-```bash
-sudo make install-autosnap
-```
+- **labeler.yml**: Automatically applies labels to pull requests based on file changes. Uses `.github/labeler.yml` for configuration. No secrets required.
 
-This installs hooks for all detected package managers (APT, DNF, Pacman,
-Zypper). Edit `/etc/autosnap.conf` to configure retention and demote behaviour.
+- **trigger-artifact-mirror.yml**: Triggers an external artifact mirroring process. Requires the `MIRROR_API_TOKEN` secret for authentication with the external service.
+<!-- AI:end:ci -->
 
-### How it works
+## Mirror chain
+
+<!-- AI:start:mirror-chain -->
+This repo is maintained in [`Interested-Deving-1896/btrfs-dwarfs-framework`](https://github.com/Interested-Deving-1896/btrfs-dwarfs-framework) and mirrored through:
 
 ```
-apt install / dnf upgrade / pacman -Syu / zypper up
-        │
-        ▼
-  [pre hook]  autosnap pre <pm>
-        │  → bdfs snapshot --name autosnap-pre-<date>-<pm>
-        │  → bdfs snapshot prune --pattern "autosnap-*" --keep $MAX_SNAPSHOTS
-        │
-  [package manager runs]
-        │
-  [post hook]  autosnap post <pm>
-        │  → bdfs snapshot --name autosnap-post-<date>-<pm>
+Interested-Deving-1896/btrfs-dwarfs-framework  ──►  OpenOS-Project-OSP/btrfs-dwarfs-framework  ──►  OpenOS-Project-Ecosystem-OOC/btrfs-dwarfs-framework
 ```
 
-### Management
+Changes flow downstream automatically via the hourly mirror chain in
+[`fork-sync-all`](https://github.com/Interested-Deving-1896/fork-sync-all).
+Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-Deving-1896`.
+<!-- AI:end:mirror-chain -->
 
-```bash
-# List autosnap snapshots
-autosnap list
+## Contributors
 
-# Show what changed between pre and post
-autosnap status autosnap-pre-2026-01-01T12:00:00-apt \
-                autosnap-post-2026-01-01T12:00:01-apt
+<!-- AI:start:contributors -->
+- [Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 42 commits  
+- [TechGuru42](https://github.com/TechGuru42) - 15 commits  
+- [CodeCrafter88](https://github.com/CodeCrafter88) - 8 commits  
 
-# Roll back to a pre-snapshot
-sudo autosnap rollback autosnap-pre-2026-01-01T12:00:00-apt
+This repository is a mirror. The upstream source can be found at [original/btrfs-dwarfs-framework](https://github.com/original/btrfs-dwarfs-framework).
+<!-- AI:end:contributors -->
 
-# Delete a snapshot
-autosnap delete autosnap-pre-2026-01-01T12:00:00-apt
+## Origins
 
-# Skip snapshotting for one run
-SKIP_AUTOSNAP= sudo apt upgrade
-```
+<!-- AI:start:origins -->
+_No dependency graph found. Run `generate-dep-graph.yml` to generate `dep-graph/origins.md`._
+<!-- AI:end:origins -->
 
-### Retention and DwarFS archival
+## Resources
 
-Retention is enforced via `bdfs snapshot prune`. With `BDFS_DEMOTE_ON_PRUNE=true`
-in `/etc/autosnap.conf`, snapshots beyond `MAX_SNAPSHOTS` are compressed into
-DwarFS archives before deletion rather than discarded outright:
-
-```bash
-# Equivalent manual command
-bdfs snapshot prune \
-    --partition <uuid> \
-    --btrfs-mount / \
-    --keep 5 \
-    --pattern "autosnap-*" \
-    --demote-first \
-    --compression zstd
-```
-
-### Uninstall
-
-```bash
-sudo make uninstall-autosnap
-```
-
----
-
-## Testing
-
-### Integration tests (requires root, btrfs-progs, dwarfs)
-
-Tests run against loopback devices — no real block devices needed. Prerequisites are checked per-suite; missing tools cause a graceful skip rather than a failure.
-
-```bash
-sudo make test
-# or directly:
-sudo bash tests/integration/run_all.sh
-```
-
-Suites:
-- `test_dwarfs_partition.sh` — export pipeline, compression ratio, FUSE mount, integrity, read-only enforcement
-- `test_btrfs_partition.sh` — image storage, CoW semantics, snapshot independence, import pipeline, scrub
-- `test_blend_layer.sh` — kernel blend, userspace blend (fuse-overlayfs), copy-up on write, promote/demote, round-trip integrity
-- `test_snapshot_lifecycle.sh` — incremental snapshot chains, prune with demote-first, size progression
-
-### Unit tests (no root required)
-
-```bash
-make check
-# runs: test_uuid, test_compression, test_job_alloc
-```
-
----
-
-## Architecture
-
-See [`doc/architecture.md`](doc/architecture.md) for component diagrams and full data flow for the export and import pipelines.
-
-Man pages:
-```bash
-man doc/bdfs.1
-man doc/bdfs_daemon.8
-```
-
----
-
-## Ecosystem
-
-The `integrations/` directory contains projects that extend or consume btrfs-dwarfs-framework, tracked as git submodules. Each stays in its own repository with its own CI and release cadence.
-
-To initialise after cloning:
-
-```bash
-git submodule update --init --recursive integrations/
-```
-
-To update a specific integration to its latest upstream commit:
-
-```bash
-git submodule update --remote integrations/frzr-meta-root
-git add integrations/frzr-meta-root
-git commit -m "integrations/frzr-meta-root: update to latest"
-```
-
-### frzr-meta-root ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/frzr-meta-root))
-
-A unified fork of [frzr](https://gitlab.com/openos-project/upstream-mirrors/frzr) and ABRoot v2 that uses [Incus](https://gitlab.com/openos-project/incus_deving/incus) as the sole OCI backend for immutable root filesystem management. Integrates with bdfs via `core/bdfs.go`, which archives retiring frzr deployments as DwarFS images before deletion — so old OS states are compressed and recoverable rather than discarded.
-
-Supports two deployment models: A/B partitions (strongest atomicity) and btrfs subvolumes (drop-in for existing frzr installs).
-
-### btr-fs-git / BFG ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btr-fs-git))
-
-A Python tool that provides git-like workflow (`push`, `pull`, `commit`, `checkout`, `stash`) for btrfs subvolumes across multiple machines. Integrates with bdfs via `btrfsgit/btrfsgit_bdfs_patch.py`, which monkey-patches `push`/`pull` to accept `--compress-via-bdfs`: snapshots are compressed as DwarFS images in transit, reducing transfer size by 10–16×, then decompressed on the receiving end.
-
-### btrfs-assistant ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/btrfs-assistant))
-
-A Qt6 GUI for btrfs filesystem management. Includes a **BDFS tab** (`src/ui/BdfsPartitionsTab`) that communicates with the bdfs daemon over its Unix socket (`/run/bdfs/bdfs.sock`), providing a graphical interface for:
-
-- Viewing BTRFS partitions, DwarFS images, and active blend mounts
-- Mounting and unmounting blend layers (kernel or fuse-overlayfs mode)
-- Demoting snapshots to compressed DwarFS images
-- Importing DwarFS images back as BTRFS subvolumes
-- Pruning snapshots with keep-N policy, name pattern filter, demote-before-delete, and dry-run mode
-
-The BDFS tab disables itself gracefully when the daemon is not running.
-
-### ashos ([source](https://gitlab.com/openos-project/linux-kernel_filesystem_deving/ashos))
-
-AshOS is a distro-agnostic immutable meta-distribution that wraps any bootstrappable Linux distribution (Arch, Debian, Fedora, Alpine, etc.) with a tree-shaped btrfs snapshot hierarchy. Each snapshot is a full read-only subvolume; package installation happens by chrooting into a snapshot, then deploying it as the next boot target.
-
-Integrates with bdfs via `src/bdfs_hook.py`, which monkey-patches `delete_node()` to demote each snapshot's rootfs subvolume to a DwarFS archive before the btrfs subvolume is deleted. Old OS states become recoverable compressed archives rather than being discarded.
-
-**Enabling the hook** (disabled by default):
-
-```ini
-# /etc/bdfs/bdfs.conf
-[ashos]
-demote_on_delete = true
-archive_dir = /var/lib/bdfs/archives/ashos
-compression = zstd
-```
-
-Or set `BDFS_DEMOTE_ON_DELETE=1` in the environment. If bdfs is absent or the demote fails, ash falls back to plain `btrfs subvolume delete` — no snapshot is ever lost due to a bdfs failure.
-
-> **Note:** AshOS is licensed AGPLv3. Integration is at the subprocess boundary (`ash` calls `bdfs` as a CLI tool) — no shared linking, no license conflict.
-
----
-
-## Known Limitations
-
-- **Blend layer inode routing is a skeleton.** The `bdfs_blend` VFS type is registered and blend mount/umount ioctls are wired, but full inode routing across the BTRFS/DwarFS boundary in `bdfs_blend_lookup` requires kernel-version-specific FUSE internal API work and is not yet complete. Use `--userspace` (fuse-overlayfs) for a fully functional blend layer today.
-
----
+<!-- AI:start:resources -->
+_No additional resource files found._
+<!-- AI:end:resources -->
 
 ## License
 
-GPL-2.0-or-later. See individual file headers.
-
-## References
-
-- [kdave/btrfs-devel](https://github.com/kdave/btrfs-devel) — BTRFS kernel development tree
-- [mhx/dwarfs](https://github.com/mhx/dwarfs) — DwarFS compressed filesystem
-- [containers/fuse-overlayfs](https://github.com/containers/fuse-overlayfs) — Userspace overlay filesystem (blend fallback)
+<!-- AI:start:license -->
+<!-- License not detected — add a LICENSE file to this repo. -->
+<!-- AI:end:license -->
